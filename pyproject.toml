@@ -3,6 +3,7 @@ name = "tls-checker"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=50.0.2",
     "fastapi>=0.162.0",
     "pydantic>=2.14.2",
     "uvicorn>=0.54.0",
@@ -35,3 +36,7 @@ no_implicit_optional = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "live: tests that hit the real network; run with `pytest -m live`",
+]
+addopts = "-m 'not live'"

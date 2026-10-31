@@ -131,3 +131,45 @@ def test_request_model_normalises_and_rejects() -> None:
 
     with pytest.raises(ValidationError):
         CheckRequest.model_validate({"hostname": "example.com", "extra": 1})
+
+
+# --- Phase 5 response model coverage ---
+
+
+def test_response_accepts_full_payload() -> None:
+    from datetime import UTC, datetime
+
+    from app.schemas import CheckResponse
+
+    payload = CheckResponse(
+        hostname="example.com",
+        verified=True,
+        hostname_verified=True,
+        subject="CN=example.com",
+        issuer="CN=Test CA",
+        not_before=datetime(2025, 1, 1, tzinfo=UTC),
+        not_after=datetime(2035, 12, 31, tzinfo=UTC),
+        days_remaining=3650,
+    )
+    assert payload.verified is True and payload.error is None
+
+
+def test_response_accepts_error_only_payload() -> None:
+    from app.schemas import CheckErrorBody, CheckResponse
+
+    payload = CheckResponse(
+        hostname="expired.example",
+        verified=False,
+        error=CheckErrorBody(kind="expired", message="certificate has expired"),
+    )
+    assert payload.error is not None and payload.error.kind == "expired"
+    assert payload.days_remaining is None
+
+
+def test_response_rejects_unknown_error_kind() -> None:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from app.schemas import CheckErrorBody
+
+    with pytest.raises(PydanticValidationError):
+        CheckErrorBody(kind="not_a_real_kind", message="x")  # type: ignore[arg-type]
