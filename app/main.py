@@ -18,7 +18,10 @@ APP_VERSION = "0.1.0"
 logger = logging.getLogger(__name__)
 _STATUS_BY_KIND: dict[ErrorKind, int] = {
     "dns_failure": 502,
+    "dns_timeout": 504,
+    "dns_capacity_exceeded": 503,
     "connection_failure": 502,
+    "blocked_destination": 403,
     "connection_timeout": 504,
     "tls_timeout": 504,
     "expired": 200,

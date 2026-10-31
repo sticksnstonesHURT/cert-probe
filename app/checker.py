@@ -1,15 +1,20 @@
 """TLS certificate inspection: stdlib ssl/socket plus cryptography.
+
 Verification policy: the primary connection uses ``create_default_context()``
-(chain + hostname verified by OpenSSL). Only if verification fails do we open a
-second, explicitly UNVERIFIED connection to fetch the peer certificate in DER
-form for metadata reporting. That second connection proves nothing about
-identity — it can be steered by a man-in-the-middle — so its output never
-influences ``verified`` or ``hostname_verified``.
-Timeouts: each network step is bounded by ``min(phase_timeout, remaining)``
-against a monotonic overall deadline recomputed before every call.
-``getaddrinfo`` accepts no timeout — DNS remains unbounded until Phase 6.
-SECURITY: no destination filtering here. ``app.netguard`` (Phase 6) is required
-before the service leaves loopback.
+(chain + hostname verified by OpenSSL). Only when certificate verification
+fails do we open a second, explicitly UNVERIFIED connection to fetch the peer
+certificate DER for metadata reporting. That second connection proves nothing
+about identity — it can be steered by a MITM — so its output never influences
+``verified`` or ``hostname_verified``.
+
+Both connections use :mod:`app.netguard`; DNS is resolved once per request and
+every resolved address is validated before any connect.
+
+Timeouts: each phase (DNS, TCP, TLS handshake) is bounded by
+``min(phase_timeout, remaining)`` against a monotonic overall deadline
+recomputed before every network call. ``getaddrinfo`` runs in a worker bounded
+by ``future.result(timeout=...)``; a worker that outlives that window cannot be
+killed (Python limitation), but the caller is freed immediately.
 """
 
 from __future__ import annotations
@@ -23,22 +28,29 @@ from typing import Literal
 
 from cryptography import x509
 
+from app import netguard
 from app.config import Settings
 
 DEFAULT_TLS_PORT = 443
 _MIN_TLS_VERSION = ssl.TLSVersion.TLSv1_2
+
 _VERIFY_CODE_EXPIRED = 10
 _VERIFY_CODE_HOSTNAME_MISMATCH = 62
+
 ErrorKind = Literal[
     "dns_failure",
+    "dns_timeout",
+    "dns_capacity_exceeded",
     "connection_failure",
     "connection_timeout",
     "tls_timeout",
+    "blocked_destination",
     "expired",
     "hostname_mismatch",
     "certificate_invalid",
     "unknown_error",
 ]
+
 _CERTIFICATE_ERROR_KINDS: frozenset[ErrorKind] = frozenset(
     {"expired", "hostname_mismatch", "certificate_invalid"}
 )
@@ -84,19 +96,34 @@ class _CheckFailure(Exception):
         super().__init__(message)
         self.kind = kind
         self.message = message
-        # Explicit override for cases where verification outcome is known
-        # independently of the error kind. None = fall back to kind-based
-        # inference in _failure_result.
+        # Explicit override for cases where the verification outcome is known
+        # independently of the error kind. None = fall back to kind inference
+        # in _failure_result.
         self.verified = verified
         self.hostname_verified = hostname_verified
 
 
 def check_certificate(hostname: str, settings: Settings) -> CheckResult:
+    """Inspect the TLS certificate presented by ``hostname``.
+
+    Runs synchronously in the calling (FastAPI worker) thread.
+    """
     deadline = time.monotonic() + settings.overall_deadline_seconds
     try:
-        info = _collect_verified(hostname, settings, deadline)
+        addresses = netguard.resolve_and_validate(hostname, DEFAULT_TLS_PORT, settings, deadline)
+    except netguard.DnsTimeout as exc:
+        return _pre_connect_failure(hostname, "dns_timeout", str(exc))
+    except netguard.DnsCapacityExceeded as exc:
+        return _pre_connect_failure(hostname, "dns_capacity_exceeded", str(exc))
+    except netguard.DnsFailure as exc:
+        return _pre_connect_failure(hostname, "dns_failure", str(exc))
+    except netguard.BlockedDestination as exc:
+        return _pre_connect_failure(hostname, "blocked_destination", str(exc))
+
+    try:
+        info = _collect_verified(hostname, settings, deadline, addresses)
     except _CheckFailure as failure:
-        return _failure_result(hostname, failure, settings, deadline)
+        return _failure_result(hostname, failure, settings, deadline, addresses)
     return CheckResult(
         hostname=hostname,
         verified=True,
@@ -109,23 +136,35 @@ def check_certificate(hostname: str, settings: Settings) -> CheckResult:
     )
 
 
+def _pre_connect_failure(hostname: str, kind: ErrorKind, message: str) -> CheckResult:
+    return CheckResult(
+        hostname=hostname,
+        verified=None,
+        hostname_verified=None,
+        error=CheckError(kind=kind, message=message),
+    )
+
+
 def _failure_result(
-    hostname: str, failure: _CheckFailure, settings: Settings, deadline: float
+    hostname: str,
+    failure: _CheckFailure,
+    settings: Settings,
+    deadline: float,
+    addresses: list[netguard.ValidatedAddress],
 ) -> CheckResult:
     info: CertificateInfo | None = None
     if failure.kind in _CERTIFICATE_ERROR_KINDS:
-        info = _inspect_unverified(hostname, settings, deadline)
+        info = _inspect_unverified(hostname, settings, deadline, addresses)
 
-    # Precedence: explicit override from the raise site, then kind inference.
     if failure.verified is not None:
-        verified = failure.verified
+        verified: bool | None = failure.verified
     elif failure.kind in _CERTIFICATE_ERROR_KINDS:
         verified = False
     else:
         verified = None
 
     if failure.hostname_verified is not None:
-        hostname_verified = failure.hostname_verified
+        hostname_verified: bool | None = failure.hostname_verified
     elif failure.kind == "hostname_mismatch":
         hostname_verified = False
     else:
@@ -151,28 +190,60 @@ def _phase_timeout(phase_seconds: float, deadline: float, label: str) -> float:
     return min(phase_seconds, remaining)
 
 
-def _open_socket(hostname: str, settings: Settings, deadline: float) -> socket.socket:
+def _connect_to_validated(
+    address: netguard.ValidatedAddress, settings: Settings, deadline: float
+) -> socket.socket:
     timeout = _phase_timeout(settings.connect_timeout_seconds, deadline, "TCP connection")
     try:
-        return socket.create_connection((hostname, DEFAULT_TLS_PORT), timeout=timeout)
+        sock = socket.socket(address.family, address.socktype, address.proto)
+    except OSError as exc:
+        raise _CheckFailure("connection_failure", f"socket creation failed: {exc}") from exc
+    try:
+        sock.settimeout(timeout)
+        sock.connect(address.sockaddr)
+        return sock
     except TimeoutError as exc:
+        sock.close()
         raise _CheckFailure(
             "connection_timeout",
-            f"connection to {hostname}:{DEFAULT_TLS_PORT} timed out after {timeout:.3f}s",
-        ) from exc
-    except socket.gaierror as exc:
-        raise _CheckFailure(
-            "dns_failure", f"DNS resolution failed for {hostname!r}: {exc}"
+            f"connection to {address.ip} timed out after {timeout:.3f}s",
         ) from exc
     except OSError as exc:
+        sock.close()
         raise _CheckFailure(
-            "connection_failure",
-            f"could not connect to {hostname}:{DEFAULT_TLS_PORT}: {exc}",
+            "connection_failure", f"could not connect to {address.ip}: {exc}"
         ) from exc
 
 
-def _collect_verified(hostname: str, settings: Settings, deadline: float) -> CertificateInfo:
-    sock = _open_socket(hostname, settings, deadline)
+def _open_connection(
+    settings: Settings,
+    deadline: float,
+    addresses: list[netguard.ValidatedAddress],
+) -> socket.socket:
+    errors: list[_CheckFailure] = []
+    for address in addresses:
+        try:
+            return _connect_to_validated(address, settings, deadline)
+        except _CheckFailure as exc:
+            errors.append(exc)
+    if not errors:
+        raise _CheckFailure("unknown_error", "no validated addresses available")
+    if len(errors) == 1:
+        raise errors[0]
+    last = errors[-1]
+    raise _CheckFailure(
+        last.kind,
+        f"all {len(errors)} validated addresses failed; last error: {last.message}",
+    )
+
+
+def _collect_verified(
+    hostname: str,
+    settings: Settings,
+    deadline: float,
+    addresses: list[netguard.ValidatedAddress],
+) -> CertificateInfo:
+    sock = _open_connection(settings, deadline, addresses)
     der: bytes | None = None
     try:
         sock.settimeout(
@@ -197,7 +268,9 @@ def _collect_verified(hostname: str, settings: Settings, deadline: float) -> Cer
             ) from exc
     finally:
         sock.close()
-    if not der:  # At this point wrap_socket returned successfully, so both certificate-chain and hostname verification passed.
+
+    if not der:
+        # Verification succeeded; only metadata extraction failed.
         raise _CheckFailure(
             "unknown_error",
             "server did not present a certificate",
@@ -216,11 +289,14 @@ def _collect_verified(hostname: str, settings: Settings, deadline: float) -> Cer
 
 
 def _inspect_unverified(
-    hostname: str, settings: Settings, deadline: float
+    hostname: str,
+    settings: Settings,
+    deadline: float,
+    addresses: list[netguard.ValidatedAddress],
 ) -> CertificateInfo | None:
     """Fetch metadata over an explicitly unverified connection. Never raises."""
     try:
-        sock = _open_socket(hostname, settings, deadline)
+        sock = _open_connection(settings, deadline, addresses)
     except _CheckFailure:
         return None
     der: bytes | None = None
@@ -242,6 +318,7 @@ def _inspect_unverified(
         return None
     finally:
         sock.close()
+
     if not der:
         return None
     try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import socket
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from unittest.mock import patch
@@ -9,6 +11,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app import netguard
 from app.checker import CheckError, CheckResult, ErrorKind
 from app.config import ConfigError, Settings, get_settings
 from app.main import create_app
@@ -77,7 +80,10 @@ def test_check_rejects_non_string_hostname(client: TestClient) -> None:
     ("kind", "expected_status"),
     [
         ("dns_failure", 502),
+        ("dns_timeout", 504),
+        ("dns_capacity_exceeded", 503),
         ("connection_failure", 502),
+        ("blocked_destination", 403),
         ("connection_timeout", 504),
         ("tls_timeout", 504),
         ("expired", 200),
@@ -126,3 +132,63 @@ def test_lifespan_stores_injected_settings() -> None:
     application = create_app(injected)
     with TestClient(application):
         assert application.state.settings is injected
+
+
+# --- DNS executor lifecycle (process-level resource) ---
+
+
+def test_lifespan_does_not_shut_down_dns_executor() -> None:
+    """Executor is a process-level resource; lifespan teardown must not replace it.
+
+    Canary: fails if anyone re-introduces shutdown_dns_executor (or any
+    executor-identity-changing call) into the FastAPI lifespan.
+    """
+    netguard.reset_dns_executor_for_tests()
+    original = netguard._executor
+    try:
+        with TestClient(create_app(Settings())):
+            pass
+        assert netguard._executor is original, (
+            "lifespan teardown must not replace netguard._executor"
+        )
+    finally:
+        netguard.reset_dns_executor_for_tests()
+
+
+def test_check_endpoint_works_after_sequential_lifespans() -> None:
+    """Endpoint and DNS executor remain usable after sequential lifespans."""
+    netguard.reset_dns_executor_for_tests()
+    fake = CheckResult(hostname="example.com", verified=True, hostname_verified=True)
+
+    try:
+        with TestClient(create_app(Settings())):
+            pass
+
+        with TestClient(create_app(Settings())) as client:
+            with patch("app.main.check_certificate", return_value=fake):
+                response = client.post("/check", json={"hostname": "example.com"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["hostname"] == "example.com"
+        assert body["verified"] is True
+        assert body["error"] is None
+
+        # Prove the shared DNS executor still accepts work after both lifespans.
+        dns_result = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443))
+        ]
+
+        with patch("app.netguard.socket.getaddrinfo", return_value=dns_result):
+            addresses = netguard.resolve_and_validate(
+                "example.com",
+                443,
+                Settings(),
+                time.monotonic() + 5,
+            )
+
+        assert len(addresses) == 1
+        assert str(addresses[0].ip) == "93.184.216.34"
+
+    finally:
+        netguard.reset_dns_executor_for_tests()
