@@ -73,6 +73,8 @@ class CheckResult:
     not_after: datetime | None = None
     days_remaining: int | None = None
     error: CheckError | None = None
+    address_count: int | None = None
+    dns_duration_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -107,23 +109,63 @@ def check_certificate(hostname: str, settings: Settings) -> CheckResult:
     """Inspect the TLS certificate presented by ``hostname``.
 
     Runs synchronously in the calling (FastAPI worker) thread.
+
+    ``address_count`` is the size of the validated address list on paths where
+    resolution succeeded; it is ``None`` on DNS-level failures (timeout,
+    capacity, failure, blocked) where no validated list was established.
+
+    ``dns_duration_ms`` is the span of the existing resolution call, in integer
+    milliseconds, on every path (success and failure alike). It is never a
+    second DNS lookup.
     """
     deadline = time.monotonic() + settings.overall_deadline_seconds
+    dns_started = time.monotonic()
     try:
         addresses = netguard.resolve_and_validate(hostname, DEFAULT_TLS_PORT, settings, deadline)
     except netguard.DnsTimeout as exc:
-        return _pre_connect_failure(hostname, "dns_timeout", str(exc))
+        return _pre_connect_failure(
+            hostname,
+            "dns_timeout",
+            str(exc),
+            dns_duration_ms=int((time.monotonic() - dns_started) * 1000),
+        )
     except netguard.DnsCapacityExceeded as exc:
-        return _pre_connect_failure(hostname, "dns_capacity_exceeded", str(exc))
+        return _pre_connect_failure(
+            hostname,
+            "dns_capacity_exceeded",
+            str(exc),
+            dns_duration_ms=int((time.monotonic() - dns_started) * 1000),
+        )
     except netguard.DnsFailure as exc:
-        return _pre_connect_failure(hostname, "dns_failure", str(exc))
+        return _pre_connect_failure(
+            hostname,
+            "dns_failure",
+            str(exc),
+            dns_duration_ms=int((time.monotonic() - dns_started) * 1000),
+        )
     except netguard.BlockedDestination as exc:
-        return _pre_connect_failure(hostname, "blocked_destination", str(exc))
+        return _pre_connect_failure(
+            hostname,
+            "blocked_destination",
+            str(exc),
+            dns_duration_ms=int((time.monotonic() - dns_started) * 1000),
+        )
+
+    dns_duration_ms = int((time.monotonic() - dns_started) * 1000)
+    address_count = len(addresses)
 
     try:
         info = _collect_verified(hostname, settings, deadline, addresses)
     except _CheckFailure as failure:
-        return _failure_result(hostname, failure, settings, deadline, addresses)
+        return _failure_result(
+            hostname,
+            failure,
+            settings,
+            deadline,
+            addresses,
+            address_count=address_count,
+            dns_duration_ms=dns_duration_ms,
+        )
     return CheckResult(
         hostname=hostname,
         verified=True,
@@ -133,15 +175,21 @@ def check_certificate(hostname: str, settings: Settings) -> CheckResult:
         not_before=info.not_before,
         not_after=info.not_after,
         days_remaining=info.days_remaining,
+        address_count=address_count,
+        dns_duration_ms=dns_duration_ms,
     )
 
 
-def _pre_connect_failure(hostname: str, kind: ErrorKind, message: str) -> CheckResult:
+def _pre_connect_failure(
+    hostname: str, kind: ErrorKind, message: str, *, dns_duration_ms: int
+) -> CheckResult:
     return CheckResult(
         hostname=hostname,
         verified=None,
         hostname_verified=None,
         error=CheckError(kind=kind, message=message),
+        address_count=None,
+        dns_duration_ms=dns_duration_ms,
     )
 
 
@@ -151,6 +199,9 @@ def _failure_result(
     settings: Settings,
     deadline: float,
     addresses: list[netguard.ValidatedAddress],
+    *,
+    address_count: int,
+    dns_duration_ms: int,
 ) -> CheckResult:
     info: CertificateInfo | None = None
     if failure.kind in _CERTIFICATE_ERROR_KINDS:
@@ -180,6 +231,8 @@ def _failure_result(
         not_after=info.not_after if info is not None else None,
         days_remaining=info.days_remaining if info is not None else None,
         error=CheckError(kind=failure.kind, message=failure.message),
+        address_count=address_count,
+        dns_duration_ms=dns_duration_ms,
     )
 
 

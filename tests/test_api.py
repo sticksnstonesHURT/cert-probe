@@ -65,7 +65,7 @@ def test_check_normalises_case_and_trailing_dot(client: TestClient) -> None:
 def test_check_rejects_invalid_hostname(client: TestClient, bad_hostname: str) -> None:
     response = client.post("/check", json={"hostname": bad_hostname})
     assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "hostname"]
+    assert response.json()["error"]["details"][0]["loc"] == ["body", "hostname"]
 
 
 def test_check_rejects_unknown_fields(client: TestClient) -> None:

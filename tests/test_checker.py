@@ -388,7 +388,7 @@ def test_overall_deadline_exhausted_before_connect() -> None:
             "app.checker.netguard.resolve_and_validate",
             return_value=_validated(PUBLIC_IP),
         ),
-        patch("app.checker.time.monotonic", side_effect=[0.0, 1000.0]),
+        patch("app.checker.time.monotonic", side_effect=[0.0, 0.0, 0.0, 1000.0]),
     ):
         result = check_certificate("example.com", _fast_settings())
 
@@ -437,6 +437,93 @@ def test_classification_by_message_without_code() -> None:
 def test_error_message_includes_verify_message() -> None:
     message = _cert_error_message(_cert_error(10, "certificate has expired"))
     assert "certificate has expired" in message
+
+
+# --- DNS metadata (Phase 7, Step 4) ---
+
+
+def test_address_count_reflects_validated_list_size() -> None:
+    """address_count must equal len(addresses) returned by netguard, in full."""
+    addresses = _validated("1.1.1.1", "8.8.8.8", "9.9.9.9")
+    result = _run(
+        addresses=addresses,
+        verified_ctx=_verified_ctx(_wrapped(VALID_DER)),
+    )
+    assert result.error is None
+    assert result.address_count == 3
+    assert result.dns_duration_ms is not None and result.dns_duration_ms >= 0
+
+
+def test_dns_duration_success_is_deterministic() -> None:
+    """On success, dns_duration_ms == (dns_end - dns_start) * 1000 as int.
+
+    Three monotonic calls: initial deadline, DNS start, DNS end. The
+    certificate collection path is stubbed so _phase_timeout does not consume
+    an additional reading.
+    """
+    fake_info = MagicMock()
+    fake_info.subject = "CN=test"
+    fake_info.issuer = "CN=test"
+    fake_info.not_before = datetime(2025, 1, 1, tzinfo=UTC)
+    fake_info.not_after = datetime(2035, 1, 1, tzinfo=UTC)
+    fake_info.days_remaining = 3650
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            return_value=_validated(PUBLIC_IP),
+        ),
+        patch("app.checker._collect_verified", return_value=fake_info),
+        patch("app.checker.time.monotonic", side_effect=[0.0, 0.0, 0.100]),
+    ):
+        result = check_certificate("example.com", _fast_settings())
+    assert result.error is None
+    assert result.dns_duration_ms == 100
+    assert result.address_count == 1
+
+
+def test_dns_duration_failure_is_deterministic() -> None:
+    """DNS failure path preserves timing; address_count is None."""
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            side_effect=netguard.DnsFailure("no"),
+        ),
+        patch("app.checker.time.monotonic", side_effect=[0.0, 0.0, 0.120]),
+    ):
+        result = check_certificate("example.com", _fast_settings())
+    assert result.error is not None and result.error.kind == "dns_failure"
+    assert result.dns_duration_ms == 120
+    assert result.address_count is None
+
+
+def test_dns_duration_timeout_is_deterministic() -> None:
+    """DNS timeout path preserves timing; address_count is None."""
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            side_effect=netguard.DnsTimeout("timed out"),
+        ),
+        patch("app.checker.time.monotonic", side_effect=[0.0, 0.0, 0.500]),
+    ):
+        result = check_certificate("example.com", _fast_settings())
+    assert result.error is not None and result.error.kind == "dns_timeout"
+    assert result.dns_duration_ms == 500
+    assert result.address_count is None
+
+
+def test_dns_duration_capacity_is_deterministic() -> None:
+    """DNS capacity path preserves timing; address_count is None."""
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            side_effect=netguard.DnsCapacityExceeded("at capacity"),
+        ),
+        patch("app.checker.time.monotonic", side_effect=[0.0, 0.0, 0.075]),
+    ):
+        result = check_certificate("example.com", _fast_settings())
+    assert result.error is not None and result.error.kind == "dns_capacity_exceeded"
+    assert result.dns_duration_ms == 75
+    assert result.address_count is None
 
 
 # --- live (opt-in, excluded by default) ---
