@@ -1,0 +1,42 @@
+# --- Version control and CI ---
+.git/
+.github/
+.gitattributes
+.gitignore
+
+# --- Python caches and bytecode ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Coverage and test artefacts ---
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+tests/
+
+# --- Virtualenvs (rebuilt inside the image from uv.lock) ---
+.venv/
+venv/
+
+# --- Editor / OS junk ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# --- Secrets and local env ---
+.env
+.env.*
+
+# --- Development docs and dev-only scripts ---
+docs/
+README.md
+Makefile
