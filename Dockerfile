@@ -49,19 +49,33 @@ COPY app ./app
 # ---------- Stage 2: runtime ----------
 FROM ${PYTHON_IMAGE} AS runtime
 
+# Non-root runtime user (UID/GID 10001).
+#   --create-home   : /home/app becomes HOME, owned 10001:10001, writable
+#   --shell <nologin> : no interactive login; verified in pre-check
+#   --no-user-group : (implicit) we use groupadd --gid 10001 separately so
+#                     UID and GID are both fixed
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/app \
+            --shell /usr/sbin/nologin app
+
 WORKDIR /app
 
+# These copies land as root:root, mode 755/644 by default (verified in
+# pre-check 2). The app user reads them — that is intentional. App code
+# and venv remain root-owned so a compromised process cannot modify them.
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/app /app/app
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/app
 
 EXPOSE 8000
 
+# Runtime process runs unprivileged. Files above remain root-owned.
+USER app
+
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-
 # No HEALTHCHECK here; compose-level health check is Phase 8.3.
-# No USER directive here; non-root user is Phase 8.2.
