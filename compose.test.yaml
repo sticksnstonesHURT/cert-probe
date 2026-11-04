@@ -1,0 +1,59 @@
+# Test overlay — never used in normal deployment.
+#
+# Invoke as:
+#   docker compose -f compose.yaml -f compose.test.yaml <command>
+#
+# Cert swap requires container recreation, not restart:
+#   FIXTURE_CERT_FILE=/certs/expired.pem \
+#     docker compose -f compose.yaml -f compose.test.yaml \
+#     up -d --force-recreate --no-deps tls-fixture
+#
+# Handshake-delay test:
+#   FIXTURE_HANDSHAKE_DELAY_MS=8000 \
+#     docker compose -f compose.yaml -f compose.test.yaml \
+#     up -d --force-recreate --no-deps tls-fixture
+
+services:
+  tls-checker:
+    environment:
+      TLS_CHECKER_TEST_MODE: "1"
+      TLS_CHECKER_FIXTURE_HOSTNAME: tls-fixture
+      TLS_CHECKER_FIXTURE_IP: 172.30.0.10
+      TLS_CHECKER_ADDITIONAL_CA_FILE: /etc/tls-checker/fixture-ca.pem
+    volumes:
+      - ./tests/fixture/certs/ca.crt:/etc/tls-checker/fixture-ca.pem:ro
+    networks:
+      default: {}
+      tls-fixture-net: {}
+
+  tls-fixture:
+    build:
+      context: ./tests/fixture
+      dockerfile: Dockerfile
+    image: tls-checker-fixture:dev
+    restart: unless-stopped
+    environment:
+      FIXTURE_CERT_FILE: ${FIXTURE_CERT_FILE:-/certs/valid.pem}
+      FIXTURE_HANDSHAKE_DELAY_MS: ${FIXTURE_HANDSHAKE_DELAY_MS:-0}
+    volumes:
+      - ./tests/fixture/certs:/certs:ro
+    networks:
+      tls-fixture-net:
+        ipv4_address: 172.30.0.10
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 443), timeout=2).close()"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  tls-fixture-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

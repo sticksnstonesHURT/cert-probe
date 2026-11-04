@@ -29,3 +29,5 @@ htmlcov/
 # Editors
 .vscode/
 .idea/
+
+tests/fixture/certs/
