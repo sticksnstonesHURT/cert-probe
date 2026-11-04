@@ -304,6 +304,8 @@ def _collect_verified(
         )
         ctx = ssl.create_default_context()
         ctx.minimum_version = _MIN_TLS_VERSION
+        if settings.additional_ca_file is not None:
+            ctx.load_verify_locations(cafile=settings.additional_ca_file)
         try:
             with ctx.wrap_socket(sock, server_hostname=hostname) as wrapped:
                 der = wrapped.getpeercert(binary_form=True)

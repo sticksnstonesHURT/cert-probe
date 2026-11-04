@@ -374,3 +374,92 @@ def test_cancelled_dns_future_is_dns_failure() -> None:
 
         with pytest.raises(netguard.DnsFailure, match="was cancelled"):
             netguard.resolve_and_validate("cancelled.example", 443, _fast_settings(), deadline)
+
+
+# --- test-fixture exemption ---
+
+
+def _fixture_settings() -> Settings:
+    return Settings(
+        dns_timeout_seconds=0.1,
+        connect_timeout_seconds=0.1,
+        tls_handshake_timeout_seconds=0.1,
+        overall_deadline_seconds=0.5,
+        test_mode=True,
+        fixture_hostname="tls-fixture",
+        fixture_ip="10.0.0.42",
+    )
+
+
+def test_fixture_mode_off_blocks_10_0_0_42() -> None:
+    deadline = time.monotonic() + 5
+    with patch("app.netguard.socket.getaddrinfo", return_value=_getaddrinfo_result("10.0.0.42")):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate("tls-fixture", 443, _fast_settings(), deadline)
+    assert exc_info.value.category == "private"
+
+
+def test_fixture_mode_permits_exact_hostname_and_ip() -> None:
+    deadline = time.monotonic() + 5
+    with patch("app.netguard.socket.getaddrinfo", return_value=_getaddrinfo_result("10.0.0.42")):
+        result = netguard.resolve_and_validate("tls-fixture", 443, _fixture_settings(), deadline)
+    assert len(result) == 1
+    assert str(result[0].ip) == "10.0.0.42"
+
+
+def test_fixture_mode_blocks_wrong_hostname() -> None:
+    deadline = time.monotonic() + 5
+    with patch("app.netguard.socket.getaddrinfo", return_value=_getaddrinfo_result("10.0.0.42")):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate("evil-fixture", 443, _fixture_settings(), deadline)
+    assert exc_info.value.category == "private"
+
+
+def test_fixture_mode_blocks_different_ip() -> None:
+    deadline = time.monotonic() + 5
+    with patch("app.netguard.socket.getaddrinfo", return_value=_getaddrinfo_result("10.0.0.43")):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate("tls-fixture", 443, _fixture_settings(), deadline)
+    assert exc_info.value.category == "non-fixture"
+
+
+def test_fixture_mode_blocks_mixed_private() -> None:
+    deadline = time.monotonic() + 5
+    infos = _getaddrinfo_result("10.0.0.42") + _getaddrinfo_result("10.0.0.43")
+    with patch("app.netguard.socket.getaddrinfo", return_value=infos):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate("tls-fixture", 443, _fixture_settings(), deadline)
+    assert exc_info.value.category == "non-fixture"
+
+
+def test_fixture_mode_blocks_mixed_public() -> None:
+    """Stricter than classify_ip: a mixed resolved set is rejected even if the
+    non-fixture address would pass public-IP validation. Exclusivity is
+    required by design."""
+    deadline = time.monotonic() + 5
+    infos = _getaddrinfo_result("10.0.0.42") + _getaddrinfo_result("1.1.1.1")
+    with patch("app.netguard.socket.getaddrinfo", return_value=infos):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate("tls-fixture", 443, _fixture_settings(), deadline)
+    assert exc_info.value.category == "non-fixture"
+
+
+def test_fixture_mode_does_not_exempt_localhost() -> None:
+    deadline = time.monotonic() + 5
+    with patch("app.netguard.socket.getaddrinfo", return_value=_getaddrinfo_result("127.0.0.1")):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate("localhost", 443, _fixture_settings(), deadline)
+    assert exc_info.value.category == "loopback"
+
+
+def test_fixture_mode_ipv4_mapped_unwraps_and_permits() -> None:
+    """A resolver returning ::ffff:10.0.0.42 for the fixture hostname passes
+    because ipv4_mapped is unwrapped before comparison."""
+    deadline = time.monotonic() + 5
+    with patch(
+        "app.netguard.socket.getaddrinfo",
+        return_value=_getaddrinfo_result("::ffff:10.0.0.42"),
+    ):
+        result = netguard.resolve_and_validate("tls-fixture", 443, _fixture_settings(), deadline)
+    assert len(result) == 1
+    assert str(result[0].ip) == str(ipaddress.ip_address("::ffff:10.0.0.42"))

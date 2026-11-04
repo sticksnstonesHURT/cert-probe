@@ -217,6 +217,19 @@ def resolve_and_validate(
     if not infos:
         raise DnsFailure(f"DNS resolution for {hostname!r} returned no addresses")
 
+    fixture_ip: IPv4Address | None = None
+    if (
+        settings.test_mode
+        and settings.fixture_hostname == hostname
+        and settings.fixture_ip is not None
+    ):
+        parsed = ipaddress.ip_address(settings.fixture_ip)
+        if not isinstance(parsed, IPv4Address):
+            raise DnsFailure(
+                f"fixture configuration is invalid: {settings.fixture_ip!r} is not IPv4"
+            )
+        fixture_ip = parsed
+
     validated: list[ValidatedAddress] = []
     for family, socktype, proto, _canonname, raw_sockaddr in infos:
         if family not in (socket.AF_INET, socket.AF_INET6):
@@ -225,8 +238,17 @@ def resolve_and_validate(
             )
         sockaddr = cast(SockAddr, raw_sockaddr)
         ip = ipaddress.ip_address(sockaddr[0])
+
+        if fixture_ip is not None:
+            compare_ip = ip.ipv4_mapped if isinstance(ip, IPv6Address) and ip.ipv4_mapped else ip
+            if compare_ip != fixture_ip:
+                raise BlockedDestination(hostname, ip, "non-fixture")
+            validated.append(ValidatedAddress(family, socktype, proto, sockaddr, ip))
+            continue
+
         category = classify_ip(ip)
         if category is not None:
             raise BlockedDestination(hostname, ip, category)
         validated.append(ValidatedAddress(family, socktype, proto, sockaddr, ip))
+
     return validated

@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -114,3 +115,141 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert first is second
     assert first.connect_timeout_seconds == 2.5
+
+
+# --- test-fixture configuration ---
+
+
+def _fixture_env(**overrides: str) -> dict[str, str]:
+    base = {
+        f"{ENV_PREFIX}TEST_MODE": "1",
+        f"{ENV_PREFIX}FIXTURE_HOSTNAME": "tls-fixture",
+        f"{ENV_PREFIX}FIXTURE_IP": "172.30.0.10",
+    }
+    base.update({f"{ENV_PREFIX}{k}": v for k, v in overrides.items()})
+    return base
+
+
+def test_fixture_hostname_without_test_mode_rejected() -> None:
+    with pytest.raises(ConfigError, match="require TLS_CHECKER_TEST_MODE=1"):
+        Settings(fixture_hostname="tls-fixture", fixture_ip="172.30.0.10")
+
+
+def test_fixture_ip_without_test_mode_rejected() -> None:
+    with pytest.raises(ConfigError, match="require TLS_CHECKER_TEST_MODE=1"):
+        Settings(fixture_ip="172.30.0.10")
+
+
+def test_additional_ca_file_without_test_mode_rejected(tmp_path: Path) -> None:
+    ca = tmp_path / "ca.pem"
+    ca.write_text("")
+    with pytest.raises(ConfigError, match="require TLS_CHECKER_TEST_MODE=1"):
+        Settings(additional_ca_file=str(ca))
+
+
+def test_test_mode_without_fixture_hostname_rejected() -> None:
+    with pytest.raises(ConfigError, match="requires TLS_CHECKER_FIXTURE_HOSTNAME"):
+        Settings(test_mode=True, fixture_ip="172.30.0.10")
+
+
+def test_test_mode_without_fixture_ip_rejected() -> None:
+    with pytest.raises(ConfigError, match="requires TLS_CHECKER_FIXTURE_IP"):
+        Settings(test_mode=True, fixture_hostname="tls-fixture")
+
+
+@pytest.mark.parametrize("bad_ip", ["not-an-ip", "1.2.3", "example.com", ""])
+def test_fixture_ip_invalid_literal_rejected(bad_ip: str) -> None:
+    with pytest.raises(ConfigError, match="FIXTURE_IP"):
+        Settings(test_mode=True, fixture_hostname="tls-fixture", fixture_ip=bad_ip)
+
+
+@pytest.mark.parametrize(
+    "bad_ip",
+    [
+        "8.8.8.8",  # public
+        "127.0.0.1",  # loopback
+        "169.254.169.254",  # link-local
+        "100.64.0.1",  # CGNAT
+        "192.0.2.1",  # TEST-NET-1
+        "0.0.0.0",  # unspecified
+    ],
+)
+def test_fixture_ip_non_rfc1918_rejected(bad_ip: str) -> None:
+    with pytest.raises(ConfigError, match="RFC1918"):
+        Settings(test_mode=True, fixture_hostname="tls-fixture", fixture_ip=bad_ip)
+
+
+def test_fixture_ip_ipv6_rejected() -> None:
+    with pytest.raises(ConfigError, match="must be an IPv4 address"):
+        Settings(test_mode=True, fixture_hostname="tls-fixture", fixture_ip="fc00::1")
+
+
+def test_additional_ca_file_missing_rejected() -> None:
+    with pytest.raises(ConfigError, match="not a regular file"):
+        Settings(
+            test_mode=True,
+            fixture_hostname="tls-fixture",
+            fixture_ip="172.30.0.10",
+            additional_ca_file="/nonexistent/ca.pem",
+        )
+
+
+def test_additional_ca_file_corrupt_pem_rejected(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.pem"
+    bad.write_text("this is not a PEM certificate\n")
+    with pytest.raises(ConfigError, match="could not be loaded"):
+        Settings(
+            test_mode=True,
+            fixture_hostname="tls-fixture",
+            fixture_ip="172.30.0.10",
+            additional_ca_file=str(bad),
+        )
+
+
+def test_valid_fixture_configuration_succeeds(tmp_path: Path) -> None:
+    """A minimal valid CA bundle (self-signed) is accepted."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(__import__("datetime").datetime(2025, 1, 1))
+        .not_valid_after(__import__("datetime").datetime(2035, 1, 1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+
+    settings = Settings(
+        test_mode=True,
+        fixture_hostname="tls-fixture",
+        fixture_ip="172.30.0.10",
+        additional_ca_file=str(ca_path),
+    )
+    assert settings.test_mode is True
+    assert settings.fixture_hostname == "tls-fixture"
+    assert settings.fixture_ip == "172.30.0.10"
+
+
+def test_fixture_environment_roundtrip() -> None:
+    settings = Settings.from_env(_fixture_env())
+    assert settings.test_mode is True
+    assert settings.fixture_hostname == "tls-fixture"
+    assert settings.fixture_ip == "172.30.0.10"
+
+
+@pytest.mark.parametrize("raw", ["true", "yes", "on", "0", "false"])
+def test_test_mode_only_accepts_one(raw: str) -> None:
+    env = _fixture_env()
+    env[f"{ENV_PREFIX}TEST_MODE"] = raw
+    with pytest.raises(ConfigError, match="TEST_MODE"):
+        Settings.from_env(env)
