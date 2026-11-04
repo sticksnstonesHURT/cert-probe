@@ -209,7 +209,7 @@ nuke:
 >@echo "WARNING: 'make nuke' will perform destructive cleanup on this host."
 >@echo ""
 >@echo "  Step 1 — docker compose down --remove-orphans"
->@echo "           removes ALL containers in compose project '$(SERVICE)'"
+>@echo "           removes containers belonging to this Compose project"
 >@echo "           removes the project's Docker network"
 >@echo "           does NOT touch containers/networks of other projects"
 >@echo ""
@@ -218,9 +218,9 @@ nuke:
 >@echo "           NOT removed: my-tls-checker:*, tls-checker-prod:*, foo/tls-checker:*"
 >@echo ""
 >@echo "Containers in project '$(SERVICE)':"
->@$(COMPOSE) ps -a --format '  {{.Name}}  {{.Status}}' 2>/dev/null || echo "  (none)"
+>@$(COMPOSE) ps -a --format '  {{.Name}}  {{.Status}}' || { echo "ABORT: preview failed — 'docker compose ps -a' returned an error" >&2; exit 1; }
 >@echo ""
 >@echo "Images matching 'tls-checker:*':"
->@docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^tls-checker:' | sed 's/^/  /' || echo "  (none)"
+>@imgs_all=$$(docker images --format '{{.Repository}}:{{.Tag}}') || { echo "ABORT: preview failed — 'docker images' returned an error" >&2; exit 1; }; imgs=$$(printf '%s\n' "$$imgs_all" | grep -E '^tls-checker:' || true); if [ -z "$$imgs" ]; then echo "  (none)"; else printf '%s\n' "$$imgs" | sed 's/^/  /'; fi
 >@echo ""
->@if [ "$$FORCE" != "1" ]; then read -p "Continue? [y/N] " ans; [ "$$ans" = "y" ] || { echo "aborted — no changes made"; exit 0; }; fi; echo ""; echo ">>> docker compose down --remove-orphans"; $(COMPOSE) down --remove-orphans || true; echo ""; echo ">>> docker rmi — tls-checker:*"; failed=""; imgs=$$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^tls-checker:' || true); if [ -z "$$imgs" ]; then echo "  (no matching images)"; else for img in $$imgs; do if docker rmi "$$img" >/dev/null 2>&1; then echo "  removed: $$img"; else echo "  FAILED:  $$img"; failed="$$failed $$img"; fi; done; fi; if [ -n "$$failed" ]; then echo ""; echo "nuke: INCOMPLETE — failed:$$failed"; exit 1; fi; echo "nuke: complete"
+>@if [ "$$FORCE" != "1" ]; then read -p "Continue? [y/N] " ans; [ "$$ans" = "y" ] || { echo "aborted — no changes made"; exit 0; }; fi; teardown_fail=""; echo ""; echo ">>> docker compose down --remove-orphans"; if ! $(COMPOSE) down --remove-orphans; then teardown_fail=1; echo "  WARNING: compose teardown failed — continuing to image cleanup"; fi; echo ""; echo ">>> docker rmi — tls-checker:*"; imgs_all=$$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); imgs_rc=$$?; img_fail=""; if [ $$imgs_rc -ne 0 ]; then echo "  ERROR: 'docker images' failed (rc=$$imgs_rc)"; img_fail=" docker-images-unavailable"; else imgs=$$(printf '%s\n' "$$imgs_all" | grep -E '^tls-checker:' || true); if [ -z "$$imgs" ]; then echo "  (no matching images)"; else for img in $$imgs; do if docker rmi "$$img" >/dev/null 2>&1; then echo "  removed: $$img"; else echo "  FAILED:  $$img"; img_fail="$$img_fail $$img"; fi; done; fi; fi; echo ""; if [ -n "$$teardown_fail" ] || [ -n "$$img_fail" ]; then echo "nuke: INCOMPLETE"; if [ -n "$$teardown_fail" ]; then echo "  cause: compose teardown failed"; fi; if [ -n "$$img_fail" ]; then echo "  cause: failed image operations:$$img_fail"; fi; exit 1; fi; echo "nuke: complete"
