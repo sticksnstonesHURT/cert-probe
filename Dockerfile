@@ -40,7 +40,7 @@ COPY pyproject.toml uv.lock .python-version ./
 
 # --locked             : fail the build if uv.lock disagrees with pyproject.toml
 # --no-dev             : runtime deps only (no pytest, mypy, ruff, httpx)
-# --no-install-project : tls-checker has no [build-system]; skip installing it.
+# --no-install-project : cert-probe has no [build-system]; skip installing it.
 #                        In-container imports of app.* work via cwd=/app.
 RUN uv sync --locked --no-dev --no-install-project
 

@@ -14,7 +14,7 @@
 #     up -d --force-recreate --no-deps tls-fixture
 
 services:
-  tls-checker:
+  cert-probe:
     environment:
       TLS_CHECKER_TEST_MODE: "1"
       TLS_CHECKER_FIXTURE_HOSTNAME: tls-fixture
@@ -30,7 +30,7 @@ services:
     build:
       context: ./tests/fixture
       dockerfile: Dockerfile
-    image: tls-checker-fixture:dev
+    image: cert-probe-fixture:dev
     restart: unless-stopped
     environment:
       FIXTURE_CERT_FILE: ${FIXTURE_CERT_FILE:-/certs/valid.pem}

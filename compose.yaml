@@ -1,9 +1,12 @@
+name: cert-probe
+
 services:
-  tls-checker:
+  cert-probe:
+    container_name: cert-probe
     build:
       context: .
       dockerfile: Dockerfile
-    image: tls-checker:dev
+    image: cert-probe:dev
     init: true
     ports:
       - "127.0.0.1:8000:8000"

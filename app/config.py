@@ -1,4 +1,4 @@
-"""Runtime configuration for the TLS Certificate Checker.
+"""Runtime configuration for the Cert Probe.
 
 Values come from environment variables and are validated once at startup.
 Invalid configuration fails loudly: silently falling back to defaults hides

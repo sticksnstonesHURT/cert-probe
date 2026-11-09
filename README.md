@@ -1,9 +1,10 @@
-# TLS Certificate Checker
+# Cert Probe
 
 A small, security-conscious HTTP API that inspects the TLS certificate of a hostname and reports whether it would verify.
 
 `v0.1.0` · Python 3.12 · Phase 9 complete
 
+> Formerly named TLS Checker. Records in `docs/` retain the original image tags, container names and CA common name because they are transcripts of runs performed under that name.
 
 --------
 
@@ -253,13 +254,13 @@ That makes a local TLS fixture unreachable by design, and public test services c
 
 The test environment solves this with an overlay, not a fork. 
 
-It uses the same application source, the same Dockerfile and the same `tls-checker:dev` image; 
+It uses the same application source, the same Dockerfile and the same `cert-probe:dev` image; 
 
 `compose.yaml` is untouched and `compose.test.yaml` adds the fixture and the test-only settings.
 
 ```mermaid
 flowchart LR
-    Host["Host loopback 127.0.0.1:8000"] --> App["tls-checker<br/>tls-checker:dev<br/>UID 10001"]
+    Host["Host loopback 127.0.0.1:8000"] --> App["cert-probe<br/>cert-probe:dev<br/>UID 10001"]
     App -- "default bridge" --> Ext["Public DNS and TLS"]
     subgraph Net["tls-fixture-net 172.30.0.0/24"]
         Fix["tls-fixture<br/>172.30.0.10:443<br/>root, no published port"]
@@ -389,7 +390,7 @@ The suite is offline and deterministic; there are nine test files containing 152
 | `make verify` | Full gate: check, build, up, smoke, down (`KEEP=1` leaves it running) |
 | `make smoke` | Deterministic checks for health, SSRF blocking and validation |
 | `make logs` / `make inspect` | Follow logs, or print the active hardening settings |
-| `make nuke` | Destructive cleanup of containers and all `tls-checker:*` images |
+| `make nuke` | Destructive cleanup of containers and all `cert-probe:*` images |
 <br>
 
 ### Build and architectures

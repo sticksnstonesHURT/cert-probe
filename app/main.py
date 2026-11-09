@@ -1,4 +1,4 @@
-"""FastAPI application entry point for the TLS Certificate Checker."""
+"""FastAPI application entry point for the Cert Probe."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from app.errors import register_exception_handlers
 from app.logging import configure_logging
 from app.schemas import CheckErrorBody, CheckRequest, CheckResponse
 
-APP_TITLE = "TLS Certificate Checker"
+APP_TITLE = "Cert Probe"
 APP_VERSION = "0.1.0"
 logger = logging.getLogger(__name__)
 # Test seam: allows the request-duration test to patch an isolated

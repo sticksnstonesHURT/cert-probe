@@ -1,4 +1,4 @@
-"""Request and response schemas for the TLS Certificate Checker API."""
+"""Request and response schemas for the Cert Probe API."""
 
 from __future__ import annotations
 
