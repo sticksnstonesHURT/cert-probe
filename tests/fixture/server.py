@@ -52,7 +52,9 @@ def main() -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", _LISTEN_PORT))
     sock.listen(_LISTEN_BACKLOG)
-    print(f"fixture listening on :{_LISTEN_PORT} cert={_CERT_FILE} delay_ms={_DELAY_MS}", flush=True)
+    print(
+        f"fixture listening on :{_LISTEN_PORT} cert={_CERT_FILE} delay_ms={_DELAY_MS}", flush=True
+    )
     try:
         while True:
             conn, _addr = sock.accept()

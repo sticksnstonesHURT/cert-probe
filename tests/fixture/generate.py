@@ -62,9 +62,7 @@ def _build_ca() -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
             ),
             critical=True,
         )
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
-        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .sign(key, hashes.SHA256())
     )
     return key, cert
@@ -104,12 +102,8 @@ def _build_leaf(
             ),
             critical=True,
         )
-        .add_extension(
-            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
-        )
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(san_dns)]), critical=False
-        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(san_dns)]), critical=False)
     )
     if issuer_cert is not None:
         builder = builder.add_extension(
@@ -122,9 +116,7 @@ def _build_leaf(
     return key, cert
 
 
-def _write_combined(
-    path: Path, key: ec.EllipticCurvePrivateKey, cert: x509.Certificate
-) -> None:
+def _write_combined(path: Path, key: ec.EllipticCurvePrivateKey, cert: x509.Certificate) -> None:
     path.write_bytes(
         cert.public_bytes(serialization.Encoding.PEM)
         + key.private_bytes(
@@ -221,9 +213,7 @@ def main() -> int:
             ),
             critical=True,
         )
-        .add_extension(
-            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
-        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
         .add_extension(
             x509.SubjectAlternativeName([x509.DNSName(FIXTURE_HOSTNAME)]), critical=False
         )
