@@ -47,3 +47,57 @@ jobs:
 
       - name: Test
         run: uv run pytest -q
+
+  docker:
+    name: Build and smoke test
+    runs-on: ubuntu-24.04
+    needs: quality
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Build image
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          load: true
+          tags: cert-probe:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Start deployment
+        run: make up
+
+      - name: Smoke checks
+        run: make smoke
+
+      - name: Assert runtime hardening
+        run: |
+          set -euo pipefail
+          cid=$(docker compose ps -q cert-probe)
+          test -n "$cid"
+          test "$(docker inspect --format '{{.Config.User}}' "$cid")" = "app"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$cid")" = "true"
+          test "$(docker inspect --format '{{.HostConfig.CapDrop}}' "$cid")" = "[ALL]"
+          test "$(docker inspect --format '{{.HostConfig.PidsLimit}}' "$cid")" = "128"
+          test "$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$cid")" = "1000000000"
+          test "$(docker inspect --format '{{.HostConfig.Memory}}' "$cid")" = "268435456"
+          test "$(docker inspect --format '{{.HostConfig.Init}}' "$cid")" = "true"
+          test "$(docker inspect --format '{{index .HostConfig.SecurityOpt 0}}' "$cid")" = "no-new-privileges:true"
+          echo "hardening assertions passed"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --no-color || true
+
+      - name: Tear down
+        if: always()
+        run: make down
