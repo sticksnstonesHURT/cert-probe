@@ -37,3 +37,200 @@ jobs:
     uses: ./.github/workflows/_pipeline.yml
     with:
       publish: true
+
+  publish-index:
+    name: Publish multi-arch index
+    runs-on: ubuntu-24.04
+    needs: pipeline
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download architecture digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Validate received digests
+        id: digests
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(find digests -maxdepth 1 -type f -name 'digest-*.txt' | sort)
+          if [ "${#files[@]}" -ne 2 ]; then
+            echo "::error::expected 2 digest files, found ${#files[@]}"
+            printf '  %s\n' "${files[@]:-<none>}"
+            exit 1
+          fi
+
+          amd64=""
+          arm64=""
+          for arch in amd64 arm64; do
+            path="digests/digest-$arch.txt"
+            if [ ! -f "$path" ]; then
+              echo "::error::missing $path"
+              exit 1
+            fi
+            lines=$(tr -d '\r' < "$path" | wc -l | tr -d ' ')
+            value=$(tr -d '[:space:]' < "$path")
+            if [ "$lines" != "1" ]; then
+              echo "::error::$path contains $lines lines, expected exactly 1"
+              exit 1
+            fi
+            if [[ ! "$value" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::$path does not contain a manifest digest: '$value'"
+              exit 1
+            fi
+            if [ "$arch" = "amd64" ]; then amd64="$value"; else arm64="$value"; fi
+          done
+
+          # Gate 5: two architecture builds cannot be the same manifest.
+          if [ "$amd64" = "$arm64" ]; then
+            echo "::error::amd64 and arm64 produced the same manifest ($amd64); refusing to publish"
+            exit 1
+          fi
+
+          {
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+          } >> "$GITHUB_OUTPUT"
+          echo "amd64=$amd64"
+          echo "arm64=$arm64"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Confirm digests resolve
+        env:
+          AMD64: ${{ steps.digests.outputs.amd64 }}
+          ARM64: ${{ steps.digests.outputs.arm64 }}
+          REPO: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+          for entry in "amd64 $AMD64" "arm64 $ARM64"; do
+            set -- $entry
+            arch=$1
+            expected=$2
+            observed=""
+            for attempt in $(seq 1 6); do
+              observed=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$repo_lc@$expected" 2>/dev/null || true)
+              [ "$observed" = "$expected" ] && break
+              echo "attempt $attempt/6: $arch manifest not resolvable yet"
+              sleep 5
+            done
+            if [ "$observed" != "$expected" ]; then
+              echo "::error::$arch manifest $repo_lc@$expected is not resolvable"
+              exit 1
+            fi
+            echo "$arch manifest resolved: $expected"
+          done
+
+      - name: Create OCI index
+        id: index
+        env:
+          AMD64: ${{ steps.digests.outputs.amd64 }}
+          ARM64: ${{ steps.digests.outputs.arm64 }}
+          REPO: ghcr.io/${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+          short_sha=${SHA:0:7}
+
+          args=("--tag" "$repo_lc:sha-$short_sha")
+          mutable=false
+          if [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+            args+=("--tag" "$repo_lc:main" "--tag" "$repo_lc:latest")
+            mutable=true
+          fi
+
+          echo "creating index for $repo_lc@$AMD64 and $repo_lc@$ARM64"
+          docker buildx imagetools create "${args[@]}" "$repo_lc@$AMD64" "$repo_lc@$ARM64"
+
+          {
+            echo "index_tag=$repo_lc:sha-$short_sha"
+            echo "repo=$repo_lc"
+            echo "mutable=$mutable"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify published index
+        env:
+          AMD64: ${{ steps.digests.outputs.amd64 }}
+          ARM64: ${{ steps.digests.outputs.arm64 }}
+          INDEX_TAG: ${{ steps.index.outputs.index_tag }}
+          REPO: ${{ steps.index.outputs.repo }}
+          MUTABLE: ${{ steps.index.outputs.mutable }}
+        run: |
+          set -euo pipefail
+
+          raw=""
+          for attempt in $(seq 1 6); do
+            if raw=$(docker buildx imagetools inspect --raw "$INDEX_TAG" 2>/dev/null) && [ -n "$raw" ]; then
+              break
+            fi
+            echo "attempt $attempt/6: $INDEX_TAG not readable yet"
+            sleep 5
+          done
+          if [ -z "$raw" ]; then
+            echo "::error::$INDEX_TAG was not readable after 6 attempts (~30s)"
+            exit 1
+          fi
+
+          count=$(jq '.manifests | length' <<<"$raw")
+          if [ "$count" != "2" ]; then
+            echo "::error::index contains $count manifests, expected exactly 2"
+            jq '.manifests' <<<"$raw"
+            exit 1
+          fi
+
+          platforms=$(jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' <<<"$raw" | sort | tr '\n' ' ')
+          if [ "$platforms" != "linux/amd64 linux/arm64 " ]; then
+            echo "::error::unexpected platforms: $platforms"
+            exit 1
+          fi
+
+          children=$(jq -r '.manifests[].digest' <<<"$raw" | sort | tr '\n' ' ')
+          expected=$(printf '%s\n%s\n' "$AMD64" "$ARM64" | sort | tr '\n' ' ')
+          if [ "$children" != "$expected" ]; then
+            echo "::error::index children do not match the tested manifests"
+            echo "  index: $children"
+            echo "  build: $expected"
+            exit 1
+          fi
+
+          index_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$INDEX_TAG")
+          echo "index digest: $index_digest"
+
+          if [ "$MUTABLE" = "true" ]; then
+            for name in main latest; do
+              ref="$REPO:$name"
+              observed=""
+              for attempt in $(seq 1 6); do
+                observed=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref" 2>/dev/null || true)
+                [ "$observed" = "$index_digest" ] && break
+                echo "attempt $attempt/6: $ref reports '${observed:-<empty>}'"
+                sleep 5
+              done
+              if [ "$observed" != "$index_digest" ]; then
+                echo "::error::$ref does not resolve to the published index ($index_digest)"
+                exit 1
+              fi
+              echo "$ref -> $index_digest"
+            done
+          else
+            echo "mutable tags not written by this run; skipped main/latest checks"
+          fi
+
+          echo "published $INDEX_TAG ($index_digest) for linux/amd64 and linux/arm64"
