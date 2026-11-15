@@ -1,0 +1,26 @@
+# Pull request entry point.
+#
+# Concurrency lives in the entry workflows, never in the reusable one: a called
+# workflow inherits the caller's run, and repeating a group name together with
+# cancel-in-progress would cancel the run that called it.
+
+name: PR
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pipeline:
+    name: Pipeline
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_pipeline.yml
+    with:
+      publish: false
