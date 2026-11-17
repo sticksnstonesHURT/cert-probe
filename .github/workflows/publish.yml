@@ -116,10 +116,12 @@ jobs:
         run: |
           set -euo pipefail
           repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
-          for entry in "amd64 $AMD64" "arm64 $ARM64"; do
-            set -- $entry
-            arch=$1
-            expected=$2
+          for arch in amd64 arm64; do
+            if [ "$arch" = "amd64" ]; then
+              expected=$AMD64
+            else
+              expected=$ARM64
+            fi
             observed=""
             for attempt in $(seq 1 6); do
               observed=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$repo_lc@$expected" 2>/dev/null || true)
@@ -152,7 +154,7 @@ jobs:
           args=("--tag" "$repo_lc:sha-$short_sha")
           mutable=false
           if [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
-            args+=("--tag" "$repo_lc:main" "--tag" "$repo_lc:latest")
+            args+=("--tag" "$repo_lc:main")
             mutable=true
           fi
 
@@ -214,7 +216,7 @@ jobs:
           echo "index digest: $index_digest"
 
           if [ "$MUTABLE" = "true" ]; then
-            for name in main latest; do
+            for name in main; do
               ref="$REPO:$name"
               observed=""
               for attempt in $(seq 1 6); do
@@ -230,7 +232,7 @@ jobs:
               echo "$ref -> $index_digest"
             done
           else
-            echo "mutable tags not written by this run; skipped main/latest checks"
+            echo "mutable tags not written by this run; skipped main check"
           fi
 
           echo "published $INDEX_TAG ($index_digest) for linux/amd64 and linux/arm64"

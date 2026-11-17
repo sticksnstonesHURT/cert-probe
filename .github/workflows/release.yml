@@ -1,0 +1,441 @@
+# Release workflow: promote an already-tested multi-arch image to versioned tags.
+#
+# Triggered by an annotated tag vX.Y.Z. Nothing is built here: the workflow
+# reads the child manifests of the sha-<short> index that publish.yml produced
+# for the tagged commit, and stitches those exact manifests under the release
+# tags. Layers, configs and platform manifests are untouched; only the index
+# wrapper is new, so its digest differs from the sha-<short> index by design.
+#
+# A single global concurrency group serialises releases: two versions must never
+# interleave, and an older release must not race a newer one onto latest.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  queue: max
+
+jobs:
+  release:
+    name: Promote and publish release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # create the GitHub Release
+      packages: write   # write release tags to GHCR
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve commit and validate version
+        id: meta
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          commit=$(git rev-parse "${GITHUB_REF}^{commit}")
+          short_sha=${commit:0:7}
+          echo "tag:    $TAG_NAME"
+          echo "commit: $commit"
+          echo "short:  $short_sha"
+
+          version=$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          echo "pyproject version: $version"
+
+          if [ "$TAG_NAME" != "v$version" ]; then
+            echo "::error::tag $TAG_NAME does not match pyproject version $version"
+            exit 1
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$version is not a stable X.Y.Z version; prereleases are not supported"
+            exit 1
+          fi
+
+          app_version=$(sed -nE 's/^APP_VERSION = "([^"]+)"$/\1/p' app/main.py)
+          if [ "$app_version" != "$version" ]; then
+            echo "::error::APP_VERSION ($app_version) does not match pyproject version ($version)"
+            exit 1
+          fi
+
+          IFS=. read -r major minor _patch <<< "$version"
+          echo "parsed: major=$major minor=$minor"
+
+          {
+            echo "commit=$commit"
+            echo "short_sha=$short_sha"
+            echo "version=$version"
+            echo "major=$major"
+            echo "minor=$minor"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect published index and existing release tag
+        id: inspect
+        env:
+          REPO: ghcr.io/${{ github.repository }}
+          SHORT: ${{ steps.meta.outputs.short_sha }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+          source_ref="$repo_lc:sha-$SHORT"
+          version_ref="$repo_lc:$VERSION"
+
+          # 0 = exists, 1 = confirmed absent, 2 = any other error (fail closed)
+          fetch_raw() {
+            local ref=$1 out
+            if out=$(docker buildx imagetools inspect --raw "$ref" 2>&1); then
+              printf '%s' "$out"
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown|HTTP 404|404 Not Found' <<<"$out"; then
+              return 1
+            fi
+            printf '%s\n' "$out" >&2
+            return 2
+          }
+
+          # Bounded retry for registry propagation. Only a confirmed 404 is
+          # retried; anything else is a real error and fails immediately.
+          fetch_source() {
+            local attempt status
+            for attempt in 1 2 3; do
+              status=0
+              fetch_raw "$source_ref" && return 0 || status=$?
+              if [ "$status" -eq 1 ]; then
+                echo "attempt $attempt/3: $source_ref not visible yet" >&2
+                sleep 5
+              else
+                return "$status"
+              fi
+            done
+            return 1
+          }
+
+          status=0
+          raw=$(fetch_source) || status=$?
+          if [ "$status" -eq 1 ]; then
+            echo "::error::no published index for commit $SHORT ($source_ref)"
+            echo "::error::push this commit to main and let the Publish workflow finish before tagging a release"
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::could not read $source_ref (registry error, not a 404)"
+            exit 1
+          fi
+
+          count=$(jq '.manifests | length' <<<"$raw")
+          if [ "$count" != "2" ]; then
+            echo "::error::$source_ref has $count manifests, expected 2"
+            exit 1
+          fi
+
+          platforms=$(jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' <<<"$raw" | sort | tr '\n' ' ')
+          if [ "$platforms" != "linux/amd64 linux/arm64 " ]; then
+            echo "::error::$source_ref platforms are '$platforms', expected 'linux/amd64 linux/arm64 '"
+            exit 1
+          fi
+
+          amd64=$(jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")][0].digest // empty' <<<"$raw")
+          arm64=$(jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64")][0].digest // empty' <<<"$raw")
+          for digest in "$amd64" "$arm64"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid child digest '$digest' in $source_ref"
+              exit 1
+            fi
+          done
+          if [ "$amd64" = "$arm64" ]; then
+            echo "::error::$source_ref has identical amd64 and arm64 manifests"
+            exit 1
+          fi
+          echo "amd64 manifest: $amd64"
+          echo "arm64 manifest: $arm64"
+
+          version_state="absent"
+          status=0
+          vraw=$(fetch_raw "$version_ref") || status=$?
+          if [ "$status" -eq 0 ]; then
+            vcount=$(jq '.manifests | length' <<<"$vraw")
+            if [ "$vcount" != "2" ]; then
+              echo "::error::$version_ref exists but is not a two-platform index (manifests: $vcount)"
+              exit 1
+            fi
+            v_amd64=$(jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")][0].digest // empty' <<<"$vraw")
+            v_arm64=$(jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64")][0].digest // empty' <<<"$vraw")
+            if [ "$v_amd64" != "$amd64" ] || [ "$v_arm64" != "$arm64" ]; then
+              echo "::error::$version_ref already exists with different content; refusing to overwrite an immutable version tag"
+              echo "  existing linux/amd64: $v_amd64"
+              echo "  existing linux/arm64: $v_arm64"
+              echo "  expected linux/amd64: $amd64"
+              echo "  expected linux/arm64: $arm64"
+              exit 1
+            fi
+            version_state="identical"
+          elif [ "$status" -eq 2 ]; then
+            echo "::error::could not determine whether $version_ref exists (registry error, not a 404)"
+            exit 1
+          fi
+          echo "$version_ref state: $version_state"
+
+          {
+            echo "repo_lc=$repo_lc"
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+            echo "version_state=$version_state"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute alias eligibility
+        id: aliases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          MAJOR: ${{ steps.meta.outputs.major }}
+          MINOR: ${{ steps.meta.outputs.minor }}
+        run: |
+          set -euo pipefail
+
+          # Version history comes from Git tags, not GitHub Releases: an image
+          # can be promoted to GHCR while `gh release create` fails, so the tag
+          # is the durable record that a version was published. Paginated, and
+          # filtered to stable vX.Y.Z so prereleases and stray tags never count.
+          tagged=$(gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/tags?per_page=100" \
+              --jq '.[].name' \
+            | sed -nE 's/^"?v([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p')
+
+          versions=$(printf '%s\n%s\n' "$tagged" "$VERSION" | sed '/^$/d')
+
+          max_all=$(printf '%s\n'   "$versions" | sort -V | tail -1)
+          max_minor=$(printf '%s\n' "$versions" | awk -F. -v M="$MAJOR" -v m="$MINOR" '$1==M && $2==m' | sort -V | tail -1)
+          max_major=$(printf '%s\n' "$versions" | awk -F. -v M="$MAJOR" '$1==M' | sort -V | tail -1)
+
+          write_latest=false
+          write_minor=false
+          write_major=false
+          if [ "$VERSION" = "$max_all" ]; then write_latest=true; fi
+          if [ -n "$max_minor" ] && [ "$VERSION" = "$max_minor" ]; then write_minor=true; fi
+          if [ "$MAJOR" != "0" ] && [ -n "$max_major" ] && [ "$VERSION" = "$max_major" ]; then write_major=true; fi
+
+          aliases=()
+          if [ "$write_minor" = "true" ]; then aliases+=("$MAJOR.$MINOR"); fi
+          if [ "$write_major" = "true" ]; then aliases+=("$MAJOR"); fi
+          if [ "$write_latest" = "true" ]; then aliases+=("latest"); fi
+
+          echo "stable version tags considered: $(printf '%s' "$tagged" | tr '\n' ' ')"
+          echo "max versions: all=$max_all minor=$max_minor major=$max_major"
+          echo "aliases to write: ${aliases[*]:-<none>}"
+          if [ "$write_latest" != "true" ]; then
+            echo "::notice::latest not moved: $VERSION is older than the newest tagged version ($max_all)"
+          fi
+
+          {
+            echo "list=${aliases[*]:-}"
+            echo "latest=$write_latest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release tags
+        id: create
+        env:
+          REPO_LC: ${{ steps.inspect.outputs.repo_lc }}
+          AMD64: ${{ steps.inspect.outputs.amd64 }}
+          ARM64: ${{ steps.inspect.outputs.arm64 }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION_STATE: ${{ steps.inspect.outputs.version_state }}
+          ALIASES: ${{ steps.aliases.outputs.list }}
+        run: |
+          set -euo pipefail
+
+          args=()
+          if [ "$VERSION_STATE" = "absent" ]; then
+            args+=("--tag" "$REPO_LC:$VERSION")
+          else
+            echo "::notice::$REPO_LC:$VERSION already exists with the expected content; leaving it untouched"
+          fi
+
+          read -r -a alias_list <<< "${ALIASES:-}"
+          for name in "${alias_list[@]:-}"; do
+            if [ -n "$name" ]; then
+              args+=("--tag" "$REPO_LC:$name")
+            fi
+          done
+
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "::notice::nothing to write: exact tag already correct and no alias is eligible"
+            echo "wrote=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "creating index with: ${args[*]}"
+          docker buildx imagetools create "${args[@]}" "$REPO_LC@$AMD64" "$REPO_LC@$ARM64"
+          echo "wrote=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release tags
+        id: verify
+        env:
+          REPO_LC: ${{ steps.inspect.outputs.repo_lc }}
+          AMD64: ${{ steps.inspect.outputs.amd64 }}
+          ARM64: ${{ steps.inspect.outputs.arm64 }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION_STATE: ${{ steps.inspect.outputs.version_state }}
+          ALIASES: ${{ steps.aliases.outputs.list }}
+          WROTE: ${{ steps.create.outputs.wrote }}
+        run: |
+          set -euo pipefail
+
+          fetch_raw() {
+            local ref=$1 out
+            for _ in 1 2 3; do
+              if out=$(docker buildx imagetools inspect --raw "$ref" 2>/dev/null); then
+                printf '%s' "$out"
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
+
+          tags=("$VERSION")
+          read -r -a alias_list <<< "${ALIASES:-}"
+          for name in "${alias_list[@]:-}"; do
+            if [ -n "$name" ]; then tags+=("$name"); fi
+          done
+
+          tag_names=()
+          tag_digests=()
+          for name in "${tags[@]}"; do
+            ref="$REPO_LC:$name"
+            if ! raw=$(fetch_raw "$ref"); then
+              echo "::error::$ref is not readable after creation"
+              exit 1
+            fi
+
+            count=$(jq '.manifests | length' <<<"$raw")
+            if [ "$count" != "2" ]; then
+              echo "::error::$ref has $count manifests, expected 2"
+              exit 1
+            fi
+
+            got_amd64=$(jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")][0].digest // empty' <<<"$raw")
+            got_arm64=$(jq -r '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64")][0].digest // empty' <<<"$raw")
+            if [ "$got_amd64" != "$AMD64" ] || [ "$got_arm64" != "$ARM64" ]; then
+              echo "::error::$ref does not map the expected manifests to the expected platforms"
+              echo "  linux/amd64: got '$got_amd64', expected '$AMD64'"
+              echo "  linux/arm64: got '$got_arm64', expected '$ARM64'"
+              exit 1
+            fi
+
+            digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
+            tag_names+=("$name")
+            tag_digests+=("$digest")
+            echo "$ref -> $digest"
+          done
+
+          index_digest=""
+          for i in "${!tag_names[@]}"; do
+            if [ "${tag_names[$i]}" = "$VERSION" ]; then index_digest="${tag_digests[$i]}"; fi
+          done
+
+          # Tags written by a single create call must share one index digest.
+          # A pre-existing exact tag is excluded: it was not rewritten, and its
+          # wrapper digest may differ while its children are identical.
+          if [ "$WROTE" = "true" ] && [ "${#tag_names[@]}" -gt 1 ]; then
+            reference=""
+            for i in "${!tag_names[@]}"; do
+              if [ "${tag_names[$i]}" = "$VERSION" ] && [ "$VERSION_STATE" = "identical" ]; then
+                continue
+              fi
+              if [ -z "$reference" ]; then
+                reference="${tag_digests[$i]}"
+                continue
+              fi
+              if [ "${tag_digests[$i]}" != "$reference" ]; then
+                echo "::error::tags written in this run do not share one index digest"
+                echo "  $VERSION: $reference"
+                echo "  ${tag_names[$i]}: ${tag_digests[$i]}"
+                exit 1
+              fi
+            done
+          fi
+
+          echo "index digest: $index_digest"
+          echo "index_digest=$index_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          status=0
+          out=$(gh release view "$TAG" --repo "$REPO" --json tagName 2>&1) || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "::notice::release $TAG already exists; leaving it untouched"
+            exit 0
+          fi
+          if ! grep -qiE 'HTTP 404|not found' <<<"$out"; then
+            echo "::error::could not determine whether release $TAG exists (not a 404)"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes
+
+      - name: Write job summary
+        if: always()
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          SHORT: ${{ steps.meta.outputs.short_sha }}
+          REPO_LC: ${{ steps.inspect.outputs.repo_lc }}
+          AMD64: ${{ steps.inspect.outputs.amd64 }}
+          ARM64: ${{ steps.inspect.outputs.arm64 }}
+          VERSION_STATE: ${{ steps.inspect.outputs.version_state }}
+          ALIASES: ${{ steps.aliases.outputs.list }}
+          WROTE: ${{ steps.create.outputs.wrote }}
+          INDEX_DIGEST: ${{ steps.verify.outputs.index_digest }}
+        run: |
+          {
+            echo "## Release ${TAG}"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Version | \`${VERSION:-unknown}\` |"
+            echo "| Commit | \`${COMMIT:-unknown}\` |"
+            echo "| Source index | \`${REPO_LC:-?}:sha-${SHORT:-?}\` |"
+            echo "| Exact tag state | ${VERSION_STATE:-unknown} |"
+            echo "| Aliases written | ${ALIASES:-none} |"
+            echo "| Index written this run | ${WROTE:-false} |"
+            echo "| Index digest | \`${INDEX_DIGEST:-n/a}\` |"
+            echo "| amd64 manifest | \`${AMD64:-n/a}\` |"
+            echo "| arm64 manifest | \`${ARM64:-n/a}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
