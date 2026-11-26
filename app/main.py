@@ -17,7 +17,7 @@ from app.logging import configure_logging
 from app.schemas import CheckErrorBody, CheckRequest, CheckResponse
 
 APP_TITLE = "Cert Probe"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 logger = logging.getLogger(__name__)
 # Test seam: allows the request-duration test to patch an isolated
 # symbol instead of the shared time.monotonic, which Starlette, AnyIO
