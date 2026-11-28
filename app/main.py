@@ -10,10 +10,11 @@ from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, Request, Response
 
-from app.checker import ErrorKind, check_certificate
+from app.checker import DEFAULT_TLS_PORT, ErrorKind, check_certificate
 from app.config import Settings, get_settings
 from app.errors import register_exception_handlers
 from app.logging import configure_logging
+from app.netguard import DestinationPolicy
 from app.render import to_response
 from app.schemas import CheckRequest, CheckResponse
 from app.version import APP_VERSION
@@ -75,7 +76,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved_settings: Annotated[Settings, Depends(_settings_from_app)],
     ) -> CheckResponse:
         started = _clock()
-        result = check_certificate(payload.hostname, resolved_settings)
+        # Port and policy are pinned here rather than left to the engine
+        # defaults, so the server's restrictions are visible at the call site.
+        # Exposing arbitrary ports would turn /check into a TCP-connect scanner,
+        # and the server must never widen its own SSRF policy. See
+        # docs/cli.md sections 6.2 and 6.4.
+        result = check_certificate(
+            payload.hostname,
+            resolved_settings,
+            port=DEFAULT_TLS_PORT,
+            policy=DestinationPolicy.PUBLIC_ONLY,
+        )
         duration_ms = int((_clock() - started) * 1000)
         if result.error is not None:
             response.status_code = _STATUS_BY_KIND.get(result.error.kind, 500)

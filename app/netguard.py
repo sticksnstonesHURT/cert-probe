@@ -25,6 +25,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from ipaddress import IPv4Address, IPv4Network, IPv6Address
 from typing import cast
 
@@ -83,12 +84,42 @@ class ValidatedAddress:
     ip: IPAddress
 
 
-def classify_ip(ip: IPAddress) -> str | None:
-    """Return a blocked category name, or ``None`` if the address is permitted.
+class DestinationPolicy(Enum):
+    """How destinations are vetted before a byte is sent.
 
-    Policy: allow only addresses that ``ipaddress.is_global`` reports as
-    globally routable. Explicit category checks run first for message quality
-    and as defence-in-depth against ``is_global``/``is_private`` regressions in
+    ``PUBLIC_ONLY`` is the server default: only globally-routable addresses
+    pass. ``LOCAL_ALLOWED`` exists for local inspection tools, where the
+    operator owns the network being probed; it relaxes the allowlist but never
+    admits a category that cannot be a TLS destination.
+
+    This is a call-level choice, deliberately not an environment variable: an
+    env var would let a misconfigured server widen its own SSRF policy.
+    """
+
+    PUBLIC_ONLY = "public_only"
+    LOCAL_ALLOWED = "local_allowed"
+
+
+# Categories no policy permits: multicast and unspecified addresses are never a
+# valid TLS destination, so relaxing the policy must not admit them.
+_NEVER_PERMITTED: frozenset[str] = frozenset({"multicast", "unspecified"})
+
+
+def classify_ip(
+    ip: IPAddress,
+    *,
+    policy: DestinationPolicy = DestinationPolicy.PUBLIC_ONLY,
+) -> str | None:
+    """Return a blocked category name, or ``None`` if ``ip`` is permitted.
+
+    ``PUBLIC_ONLY`` (the default) allows only addresses that
+    ``ipaddress.is_global`` reports as globally routable. ``LOCAL_ALLOWED``
+    additionally permits loopback, private, link-local, CGNAT, reserved and
+    other non-global addresses, but still rejects the categories in
+    :data:`_NEVER_PERMITTED`, which can never be a TLS destination.
+
+    Explicit category checks run first for message quality and as
+    defence-in-depth against ``is_global``/``is_private`` regressions in
     individual Python patch versions (notably IPv6 multicast, which some
     ``is_global`` implementations have historically classified as global).
 
@@ -99,6 +130,16 @@ def classify_ip(ip: IPAddress) -> str | None:
     if isinstance(ip, IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
 
+    category = _blocked_category(ip)
+    if category is None:
+        return None
+    if policy is DestinationPolicy.LOCAL_ALLOWED and category not in _NEVER_PERMITTED:
+        return None
+    return category
+
+
+def _blocked_category(ip: IPAddress) -> str | None:
+    """Return the blocked category for ``ip``, or ``None`` if globally routable."""
     if ip.is_loopback:
         return "loopback"
     if ip.is_link_local:
@@ -188,11 +229,17 @@ def resolve_and_validate(
     port: int,
     settings: Settings,
     deadline: float,
+    *,
+    policy: DestinationPolicy = DestinationPolicy.PUBLIC_ONLY,
 ) -> list[ValidatedAddress]:
     """Resolve ``hostname`` once and validate every returned address.
 
     ``deadline`` is an absolute monotonic deadline; the effective DNS timeout
     is ``min(settings.dns_timeout_seconds, deadline - now)``.
+
+    ``policy`` is passed to :func:`classify_ip` for every resolved address. It
+    defaults to ``PUBLIC_ONLY``, so callers that do not opt in get the server
+    policy.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -246,7 +293,7 @@ def resolve_and_validate(
             validated.append(ValidatedAddress(family, socktype, proto, sockaddr, ip))
             continue
 
-        category = classify_ip(ip)
+        category = classify_ip(ip, policy=policy)
         if category is not None:
             raise BlockedDestination(hostname, ip, category)
         validated.append(ValidatedAddress(family, socktype, proto, sockaddr, ip))

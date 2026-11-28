@@ -214,6 +214,84 @@ def test_non_global_category_is_reachable_for_safety_net() -> None:
         assert result is None or result == "non-global"
 
 
+# --- destination policy ---
+
+
+@pytest.mark.parametrize(
+    "ip, expected_category",
+    [
+        ("127.0.0.1", "loopback"),
+        ("::1", "loopback"),
+        ("::ffff:127.0.0.1", "loopback"),
+        ("10.0.0.1", "private"),
+        ("192.168.1.1", "private"),
+        ("169.254.1.1", "link-local"),
+        ("100.64.0.1", "cgnat"),
+    ],
+)
+def test_local_allowed_permits_non_global_addresses(ip: str, expected_category: str) -> None:
+    """LOCAL_ALLOWED permits exactly what PUBLIC_ONLY rejects, same categories."""
+    address = ipaddress.ip_address(ip)
+    assert netguard.classify_ip(address) == expected_category
+    assert netguard.classify_ip(address, policy=netguard.DestinationPolicy.LOCAL_ALLOWED) is None
+
+
+@pytest.mark.parametrize("ip", ["224.0.0.1", "ff02::1"])
+def test_local_allowed_still_rejects_multicast(ip: str) -> None:
+    """Relaxing the policy must not admit addresses that can never serve TLS."""
+    address = ipaddress.ip_address(ip)
+    assert (
+        netguard.classify_ip(address, policy=netguard.DestinationPolicy.LOCAL_ALLOWED)
+        == "multicast"
+    )
+
+
+@pytest.mark.parametrize("ip", ["0.0.0.0", "::"])
+def test_local_allowed_still_rejects_unspecified(ip: str) -> None:
+    address = ipaddress.ip_address(ip)
+    assert (
+        netguard.classify_ip(address, policy=netguard.DestinationPolicy.LOCAL_ALLOWED)
+        == "unspecified"
+    )
+
+
+def test_local_allowed_still_permits_public_addresses() -> None:
+    address = ipaddress.ip_address("93.184.216.34")
+    assert netguard.classify_ip(address, policy=netguard.DestinationPolicy.LOCAL_ALLOWED) is None
+
+
+def test_resolve_and_validate_applies_local_allowed_policy() -> None:
+    """The policy reaches classify_ip through resolve_and_validate."""
+    deadline = time.monotonic() + 5
+    infos = _getaddrinfo_result("10.0.0.1")
+    with patch("app.netguard.socket.getaddrinfo", return_value=infos):
+        with pytest.raises(netguard.BlockedDestination):
+            netguard.resolve_and_validate("local.example", 443, _fast_settings(), deadline)
+        result = netguard.resolve_and_validate(
+            "local.example",
+            443,
+            _fast_settings(),
+            deadline,
+            policy=netguard.DestinationPolicy.LOCAL_ALLOWED,
+        )
+    assert [str(address.ip) for address in result] == ["10.0.0.1"]
+
+
+def test_resolve_and_validate_local_allowed_still_blocks_multicast() -> None:
+    deadline = time.monotonic() + 5
+    infos = _getaddrinfo_result("224.0.0.1")
+    with patch("app.netguard.socket.getaddrinfo", return_value=infos):
+        with pytest.raises(netguard.BlockedDestination) as exc_info:
+            netguard.resolve_and_validate(
+                "multicast.example",
+                443,
+                _fast_settings(),
+                deadline,
+                policy=netguard.DestinationPolicy.LOCAL_ALLOWED,
+            )
+    assert exc_info.value.category == "multicast"
+
+
 # --- shared DNS executor tests ---
 
 

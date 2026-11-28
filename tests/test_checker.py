@@ -17,6 +17,7 @@ from cryptography.x509.oid import NameOID
 
 from app import netguard
 from app.checker import (
+    DEFAULT_TLS_PORT,
     CheckResult,
     _cert_error_message,
     _CheckFailure,
@@ -397,16 +398,93 @@ def test_overall_deadline_exhausted_before_connect() -> None:
     assert "overall deadline" in result.error.message
 
 
+def test_overall_deadline_exhausted_before_handshake_is_tls_timeout() -> None:
+    """An exhausted deadline is attributed to the phase that ran out.
+
+    The connect succeeds here, so the remaining budget is spent before the TLS
+    handshake. That must report ``tls_timeout``, not ``connection_timeout``.
+    """
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            return_value=_validated(PUBLIC_IP),
+        ),
+        patch(
+            "app.checker._connect_to_validated",
+            side_effect=lambda *_a, **_kw: MagicMock(spec=socket.socket),
+        ),
+        patch("app.checker.time.monotonic", side_effect=[0.0, 0.0, 0.0, 1000.0]),
+    ):
+        result = check_certificate("example.com", _fast_settings())
+
+    assert result.error is not None
+    assert result.error.kind == "tls_timeout"
+    assert "overall deadline" in result.error.message
+
+
+# --- engine parameters (port, destination policy) ---
+
+
+def test_default_port_and_policy_are_forwarded_to_resolution() -> None:
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            return_value=_validated(PUBLIC_IP),
+        ) as mock_resolve,
+        patch(
+            "app.checker._connect_to_validated",
+            side_effect=lambda *_a, **_kw: MagicMock(spec=socket.socket),
+        ),
+        patch("app.checker._collect_verified", side_effect=_CheckFailure("tls_timeout", "stub")),
+    ):
+        check_certificate("example.com", _fast_settings())
+
+    assert mock_resolve.call_args.args[1] == DEFAULT_TLS_PORT
+    assert mock_resolve.call_args.kwargs["policy"] is netguard.DestinationPolicy.PUBLIC_ONLY
+
+
+def test_custom_port_and_policy_are_forwarded_to_resolution() -> None:
+    with (
+        patch(
+            "app.checker.netguard.resolve_and_validate",
+            return_value=_validated(PUBLIC_IP),
+        ) as mock_resolve,
+        patch(
+            "app.checker._connect_to_validated",
+            side_effect=lambda *_a, **_kw: MagicMock(spec=socket.socket),
+        ),
+        patch("app.checker._collect_verified", side_effect=_CheckFailure("tls_timeout", "stub")),
+    ):
+        check_certificate(
+            "example.com",
+            _fast_settings(),
+            port=8443,
+            policy=netguard.DestinationPolicy.LOCAL_ALLOWED,
+        )
+
+    assert mock_resolve.call_args.args[1] == 8443
+    assert mock_resolve.call_args.kwargs["policy"] is netguard.DestinationPolicy.LOCAL_ALLOWED
+
+
 def test_phase_timeout_shrinks_to_remaining_budget() -> None:
     with patch("app.checker.time.monotonic", return_value=100.0):
-        budget = _phase_timeout(5.0, 101.0, "TCP connection")
+        budget = _phase_timeout(5.0, 101.0, "TCP connection", kind="connection_timeout")
     assert budget == pytest.approx(1.0, abs=1e-6)
 
 
 def test_phase_timeout_raises_when_deadline_passed() -> None:
     with patch("app.checker.time.monotonic", return_value=100.0):
-        with pytest.raises(_CheckFailure):
-            _phase_timeout(5.0, 50.0, "TCP connection")
+        with pytest.raises(_CheckFailure) as exc_info:
+            _phase_timeout(5.0, 50.0, "TCP connection", kind="connection_timeout")
+    assert exc_info.value.kind == "connection_timeout"
+
+
+def test_phase_timeout_uses_the_callers_error_kind() -> None:
+    """The kind comes from the phase, so a handshake deadline is tls_timeout."""
+    with patch("app.checker.time.monotonic", return_value=100.0):
+        with pytest.raises(_CheckFailure) as exc_info:
+            _phase_timeout(5.0, 50.0, "TLS handshake", kind="tls_timeout")
+    assert exc_info.value.kind == "tls_timeout"
 
 
 # --- parsing and classification ---

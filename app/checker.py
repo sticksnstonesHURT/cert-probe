@@ -107,10 +107,22 @@ class _CheckFailure(Exception):
         self.hostname_verified = hostname_verified
 
 
-def check_certificate(hostname: str, settings: Settings) -> CheckResult:
+def check_certificate(
+    hostname: str,
+    settings: Settings,
+    *,
+    port: int = DEFAULT_TLS_PORT,
+    policy: netguard.DestinationPolicy = netguard.DestinationPolicy.PUBLIC_ONLY,
+) -> CheckResult:
     """Inspect the TLS certificate presented by ``hostname``.
 
     Runs synchronously in the calling (FastAPI worker) thread.
+
+    ``port`` is the TCP port to handshake on and defaults to 443, so callers
+    that do not care about ports are unaffected.
+
+    ``policy`` decides which resolved addresses are permitted. It defaults to
+    ``PUBLIC_ONLY``; only a local tool should pass ``LOCAL_ALLOWED``.
 
     ``address_count`` is the size of the validated address list on paths where
     resolution succeeded; it is ``None`` on DNS-level failures (timeout,
@@ -123,7 +135,7 @@ def check_certificate(hostname: str, settings: Settings) -> CheckResult:
     deadline = time.monotonic() + settings.overall_deadline_seconds
     dns_started = time.monotonic()
     try:
-        addresses = netguard.resolve_and_validate(hostname, DEFAULT_TLS_PORT, settings, deadline)
+        addresses = netguard.resolve_and_validate(hostname, port, settings, deadline, policy=policy)
     except netguard.DnsTimeout as exc:
         return _pre_connect_failure(
             hostname,
@@ -238,17 +250,29 @@ def _failure_result(
     )
 
 
-def _phase_timeout(phase_seconds: float, deadline: float, label: str) -> float:
+def _phase_timeout(phase_seconds: float, deadline: float, label: str, *, kind: ErrorKind) -> float:
+    """Return the budget for a phase, or fail with that phase's own error kind.
+
+    ``kind`` is supplied by the caller rather than hard-coded here, so an
+    exhausted overall deadline is attributed to the phase that actually ran
+    out: a TCP connect reports ``connection_timeout``, a TLS handshake reports
+    ``tls_timeout``.
+    """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise _CheckFailure("connection_timeout", f"overall deadline exceeded before {label}")
+        raise _CheckFailure(kind, f"overall deadline exceeded before {label}")
     return min(phase_seconds, remaining)
 
 
 def _connect_to_validated(
     address: netguard.ValidatedAddress, settings: Settings, deadline: float
 ) -> socket.socket:
-    timeout = _phase_timeout(settings.connect_timeout_seconds, deadline, "TCP connection")
+    timeout = _phase_timeout(
+        settings.connect_timeout_seconds,
+        deadline,
+        "TCP connection",
+        kind="connection_timeout",
+    )
     try:
         sock = socket.socket(address.family, address.socktype, address.proto)
     except OSError as exc:
@@ -302,7 +326,12 @@ def _collect_verified(
     der: bytes | None = None
     try:
         sock.settimeout(
-            _phase_timeout(settings.tls_handshake_timeout_seconds, deadline, "TLS handshake")
+            _phase_timeout(
+                settings.tls_handshake_timeout_seconds,
+                deadline,
+                "TLS handshake",
+                kind="tls_timeout",
+            )
         )
         ctx = ssl.create_default_context()
         ctx.minimum_version = _MIN_TLS_VERSION
@@ -363,6 +392,7 @@ def _inspect_unverified(
                 settings.tls_handshake_timeout_seconds,
                 deadline,
                 "inspection handshake",
+                kind="tls_timeout",
             )
         )
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
