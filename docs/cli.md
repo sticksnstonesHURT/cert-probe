@@ -256,7 +256,7 @@ codes are for shell control flow.
 Prints both names and the one shared version literal:
 
 ```
-probe (cert-probe) 0.2.0
+probe (cert-probe) 0.3.0
 ```
 
 The literal lives in `app/version.py` and is the same value the API reports in its OpenAPI
