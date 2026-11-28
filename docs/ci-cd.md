@@ -249,12 +249,12 @@ Two consequences worth remembering:
 ```bash
 # 1. bump the version in both places
 #    pyproject.toml        version = "0.2.0"
-#    app/main.py           APP_VERSION = "0.2.0"
+#    app/version.py        APP_VERSION = "0.2.0"
 uv lock                       # if dependencies changed
 make check                    # must be green
 
 # 2. commit and push
-git add pyproject.toml app/main.py uv.lock
+git add pyproject.toml app/version.py uv.lock
 git commit -m "release: prepare v0.2.0"
 git push
 
