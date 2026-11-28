@@ -280,8 +280,11 @@ representation anywhere in the project, and adding one is a design error, not a 
 
 **Not included:** `address_count` and `dns_duration_ms`. They exist on `CheckResult` for
 server-side telemetry (`app/main.py` logs them) and are deliberately absent from the API
-document. `--json` matches the API document, not the internal dataclass, so the two
-surfaces stay byte-comparable.
+document. `--json` matches the API document, not the internal dataclass.
+
+The CLI emits this document as a single compact line using the same separators as
+Starlette's `JSONResponse`, so it is byte-comparable with the HTTP body and pipe-friendly
+for `jq`.
 
 ### 8.2 Tri-state honesty
 
@@ -315,6 +318,7 @@ expired.example.com
   valid:           2020-01-01T00:00:00Z .. 2021-01-01T00:00:00Z
   expires in:      -1800 days
   finding:         expired
+  message:         certificate has expired
 ```
 
 Certificate metadata on a failed verification comes from the engine's unverified fallback
@@ -455,9 +459,20 @@ Invariants enforced by `app/config.py`, all failing as exit `2`:
 Every phase runs under `min(phase_timeout, remaining)` against a monotonic deadline, so no
 phase can overrun the total.
 
-Command-line timeout flags mirror these variables, with unset flags falling back to the
-environment and then to the defaults. The exact flag names are the one detail still open
-within the CLI implementation step; they will be recorded here when finalised.
+Command-line timeout flags mirror these variables exactly. An unset flag falls
+back to the environment value, and then to the built-in default:
+
+| Flag | Overrides |
+|---|---|
+| `--dns-timeout SECONDS` | `TLS_CHECKER_DNS_TIMEOUT` |
+| `--connect-timeout SECONDS` | `TLS_CHECKER_CONNECT_TIMEOUT` |
+| `--handshake-timeout SECONDS` | `TLS_CHECKER_TLS_HANDSHAKE_TIMEOUT` |
+| `--overall-deadline SECONDS` | `TLS_CHECKER_OVERALL_DEADLINE` |
+
+Overrides are applied to the environment-derived configuration and re-validated by
+the same `Settings` rules, so an inconsistent combination — for example an overall
+deadline smaller than the largest phase — exits `2` with the server's own message
+rather than a CLI-specific approximation.
 
 **Deferred:** the environment variables keep the `TLS_CHECKER_` prefix throughout this
 milestone, even though the distribution is now `cert-probe`. Renaming them to
