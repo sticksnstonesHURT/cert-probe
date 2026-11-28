@@ -1,8 +1,10 @@
 # Cert Probe
 
-A small, security-conscious HTTP API that inspects the TLS certificate of a hostname and reports whether it would verify.
+A small, security-conscious tool that inspects the TLS certificate of a hostname and reports whether it would verify.
 
-`v0.1.0` · Python 3.12 · Phase 9 complete
+It is available two ways: an HTTP API (Docker) and a standalone Linux binary called `probe`. Both call the same inspection engine, so they cannot disagree about a certificate.
+
+`v0.2.0` · Python 3.12
 
 > Formerly named TLS Checker. Records in `docs/` retain the original image tags, container names and CA common name because they are transcripts of runs performed under that name.
 
@@ -61,6 +63,8 @@ Values above are illustrative.
 #### Requirements: 
 Docker Engine with the Compose plugin. 
 `uv` is only needed for local Python work and for generating test certificates.
+
+To inspect a hostname without Docker or Python, use the standalone [`probe` binary](#command-line-interface) instead.
 <br>
 
 From the project directory:
@@ -163,6 +167,119 @@ Like the API itself, these are unauthenticated.
 
 ---
 
+## Command-line interface
+
+The `probe` binary inspects one hostname locally. It calls the same engine as the API — there is no second TLS implementation and no HTTP request to the service — and it is a standalone Linux executable, so **Python is not required** on the machine that runs it.
+
+### Install
+
+Download the archive for your architecture from the [Releases](https://github.com/sticksnstonesHURT/cert-probe/releases) page:
+
+| Architecture | Asset |
+|---|---|
+| Linux AMD64 (x86_64) | `cert-probe-<version>-linux-amd64.tar.gz` |
+| Linux ARM64 (aarch64) | `cert-probe-<version>-linux-arm64.tar.gz` |
+
+Each release also publishes `SHA256SUMS`, covering both archives. The CLI archives are attached from the first release that includes them; a release page without `cert-probe-*-linux-*.tar.gz` assets predates the CLI.
+
+The asset names carry the product name (`cert-probe`); each archive contains a directory named after the command (`probe/`).
+
+```bash
+version=<version>   # the tag from the Releases page, without the leading "v"
+arch=amd64          # or arm64
+
+curl -LO "https://github.com/sticksnstonesHURT/cert-probe/releases/download/v${version}/cert-probe-${version}-linux-${arch}.tar.gz"
+curl -LO "https://github.com/sticksnstonesHURT/cert-probe/releases/download/v${version}/SHA256SUMS"
+
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf "cert-probe-${version}-linux-${arch}.tar.gz"
+sudo install -m 0755 probe/probe /usr/local/bin/probe
+
+probe --version
+```
+
+`--ignore-missing` lets the shared `SHA256SUMS` verify a single downloaded archive instead of failing on the other architecture.
+
+To rebuild the binary yourself, run `packaging/build-cli.sh` inside a `manylinux_2_28` container; the script header records the exact commands, and the image digests are pinned in the `cli-binaries` job in `.github/workflows/release.yml`.
+
+### Requirements
+
+- Linux on AMD64 or ARM64, with **glibc 2.28 or newer**. The binaries are built inside `manylinux_2_28` so the requirement stays at 2.28 rather than the build host's 2.39.
+- **No Python** installation; the interpreter and libraries are bundled.
+- A CA certificate bundle. The binary uses the system trust store, so a minimal container image without `ca-certificates` reports every certificate as `certificate_invalid` even though it was fetched and parsed correctly.
+
+| Distribution | glibc | Supported |
+|---|---|---|
+| Debian 11 (bullseye) | 2.31 | yes |
+| Debian 12 (bookworm) | 2.36 | yes |
+| Debian 13 (trixie) | 2.41 | yes |
+| Ubuntu 20.04 / 22.04 / 24.04 | 2.31 / 2.35 / 2.39 | yes |
+| Alpine (musl) | — | no |
+
+Debian 11 and Debian 12 were exercised with a built binary as part of release-build validation. The other rows follow from the asserted glibc floor rather than from a direct test on that distribution.
+
+### Usage
+
+```bash
+probe example.com
+```
+
+```
+example.com
+  verified:        yes
+  hostname:        yes
+  subject:         CN=example.com
+  issuer:          CN=Cloudflare TLS Issuing ECC CA 3,O=SSL Corporation,C=US
+  valid:           2026-11-24T23:48:34Z .. 2027-02-22T23:53:08Z
+  expires in:      86 days
+```
+
+`--json` prints exactly the document `POST /check` returns, on a single line, so the two surfaces stay interchangeable in scripts:
+
+```bash
+probe example.com --json | jq .error.kind
+```
+
+`verified` and `hostname_verified` are tri-state: `true`, `false`, or `unknown`, where `unknown` means the value was never determined (for example a DNS or connection failure). Text output prints `unknown` and JSON emits `null`. `unknown` is **not** `false`.
+
+`days_remaining` counts whole days and is negative once the certificate has expired.
+
+### Options
+
+| Option | Meaning |
+|---|---|
+| `HOSTNAME` | Required. The DNS name to inspect. |
+| `--port N` | TCP port to connect to. Default `443`. |
+| `--allow-private` | Permit loopback, private, link-local and other non-globally-routable destinations. |
+| `--json` | Emit the API response document instead of human-readable text. |
+| `--dns-timeout SECONDS` | DNS budget. Default `$TLS_CHECKER_DNS_TIMEOUT` or 3.0. |
+| `--connect-timeout SECONDS` | Per-address connect budget. Default `$TLS_CHECKER_CONNECT_TIMEOUT` or 5.0. |
+| `--handshake-timeout SECONDS` | TLS handshake budget. Default `$TLS_CHECKER_TLS_HANDSHAKE_TIMEOUT` or 5.0. |
+| `--overall-deadline SECONDS` | Total budget. Default `$TLS_CHECKER_OVERALL_DEADLINE` or 10.0. Must be at least the largest phase timeout and at most 30. |
+| `--version`, `--help` | Print the version, or the usage text. |
+
+The four timeout variables are the ones the API reads, and combinations are validated the same way, so `--overall-deadline 1 --connect-timeout 5` is rejected with the server's own message. IP literals and `host:port` are rejected: the port is a separate flag, because an IP address has no SNI and would need a certificate-matching path the engine does not implement.
+
+### Destination policy
+
+The API only ever allows globally-routable destinations. The CLI defaults to the same policy, so `probe localhost` is rejected with `blocked_destination`. `--allow-private` opts in to local targets for inspecting your own network. That override is a command-line flag and deliberately **not** an environment variable, so it cannot be switched on for the service.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Verified. |
+| `1` | Certificate finding: `expired`, `hostname_mismatch` or `certificate_invalid`. |
+| `2` | Usage or configuration error. |
+| `3` | Network or destination error: blocked destination, DNS failure or timeout, connect failure or timeout, handshake timeout. |
+| `4` | Unexpected internal error. |
+
+A certificate finding is a successful answer, exactly as `POST /check` reports it with HTTP 200, so `1` does not mean the tool failed. For scripts that need the detail rather than the category, read `error.kind` from `--json`.
+
+Results go to stdout and diagnostics to stderr, so `--json` output is always parseable.
+
+---
+
 ## Configuration
 
 All values come from environment variables and are validated once at startup. 
@@ -198,6 +315,8 @@ The service is a deliberate SSRF boundary. Before any byte is sent:
 4. The connection targets the validated socket address, not the hostname, and TLS SNI still uses the original hostname.
 
 5. No second DNS lookup happens, so a hostname that changes answer between validation and connection cannot redirect the request.
+
+The **CLI** defaults to this same policy, so `probe localhost` is rejected identically. It offers `--allow-private` for inspecting hosts on your own network; that override is a command-line flag and deliberately not an environment variable, so it cannot be enabled for the service. See [Command-line interface](#command-line-interface).
 
 DNS runs in one shared, bounded thread pool: 8 workers, 24 queued jobs, 32 operations in flight in total. 
 
@@ -353,7 +472,7 @@ make check
 
 This runs `ruff format --check`, `ruff check`, `mypy` and `pytest`. 
 
-The suite is offline and deterministic; there are nine test files containing 152 test functions before parametrisation.
+The suite is offline and deterministic; there are ten test files containing 189 test functions before parametrisation, collected as 326 cases (the two `live` tests are deselected).
 
 | Area | Covered |
 |---|---|
@@ -365,6 +484,7 @@ The suite is offline and deterministic; there are nine test files containing 152
 | API contract | Status mapping, response shape, error envelope, tri-state invariants |
 | Configuration | Fail-closed fixture validation, CA probing, immutability, caching |
 | Logging | Field order, levels, no private data, handler idempotency |
+| CLI contract | Argument parsing, exit code for every error kind, `--json` parity with the API document, stdout/stderr separation, import boundary |
 <br>
 
 ### What is not covered
@@ -373,9 +493,11 @@ The suite is offline and deterministic; there are nine test files containing 152
 
 - `pytest -m live` performs real network checks against external hosts and is excluded by default, because those hosts are intermittent.
 
-- There is no CI pipeline and no coverage threshold configured.
+- No coverage threshold is configured, and no coverage is reported.
 
 - No load or soak testing is part of the automated suite; the capacity work was a separate, manual evaluation.
+
+- The released CLI binaries are not exercised by the test suite. They are built, smoke-tested and glibc-checked in the release workflow, which is evidence but not a substitute for a test.
 
 ------
 
@@ -498,8 +620,9 @@ They describe where this deployment saturates and how it fails; they are not a s
 - The SSL context is rebuilt per request; safe caching would need a key that still allows fixture certificate swaps to take effect.
 - Certificate metadata from the unverified fallback is informational only and can be influenced by a man-in-the-middle.
 - An explicit application-level request-body size limit is not currently configured.
-- No automated integration tests for the fixture scenarios, and no CI pipeline.
+- No automated integration tests for the fixture scenarios.
 - The fixture container runs as root without resource limits, as described above.
+- The CLI builds on the host's system trust store and offers no flag for a custom CA bundle, so private CAs are not supported by the binary.
 
 -----
 
@@ -512,12 +635,16 @@ They describe where this deployment saturates and how it fails; they are not a s
 | `app/checker.py` | Deadline handling, verified handshake, metadata fallback, DER parsing |
 | `app/netguard.py` | Address classification, bounded DNS resolution |
 | `app/config.py` | Environment parsing and fail-closed validation |
+| `app/render.py`, `app/version.py` | Shared result mapping, single version literal |
 | `app/errors.py`, `app/logging.py` | Error envelope, structured logging |
-| `tests/` | Offline unit and API tests |
+| `cli/` | `probe` command-line interface |
+| `packaging/` | PyInstaller spec and the standalone binary build script |
+| `tests/` | Offline unit, API and CLI tests |
 | `tests/fixture/` | Fixture server, certificate generator, fixture image |
 | `compose.yaml`, `compose.test.yaml` | Normal deployment, test overlay |
 | `Dockerfile`, `Makefile`, `pyproject.toml`, `uv.lock` | Build, workflow, dependencies |
-| `docs/` | Verification and measurement records |
+| `.github/workflows/` | PR validation, publishing and release pipelines |
+| `docs/` | Design, verification and measurement records |
 
 ----
 
@@ -529,3 +656,5 @@ They describe where this deployment saturates and how it fails; they are not a s
 | [docs/arm64-verification.md](docs/arm64-verification.md) | Native ARM64 build, runtime identity, security settings, validation |
 | [docs/amd64-verification.md](docs/amd64-verification.md) | Native AMD64 build and validation, including a DNS incident log |
 | [docs/graceful-shutdown.md](docs/graceful-shutdown.md) | Signal path, drain behaviour and stop grace-period guidance |
+| [docs/cli.md](docs/cli.md) | CLI design, output and exit-code contracts, release conventions |
+| [docs/ci-cd.md](docs/ci-cd.md) | CI/CD pipeline end to end: PR validation, publishing and releases |
