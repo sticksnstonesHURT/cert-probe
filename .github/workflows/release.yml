@@ -138,7 +138,12 @@ jobs:
             exit 1
           fi
 
-          app_version=$(sed -nE 's/^APP_VERSION = "([^"]+)"$/\1/p' app/main.py)
+          app_version=$(sed -nE 's/^APP_VERSION = "([^"]+)"$/\1/p' app/version.py)
+          if [ -z "$app_version" ]; then
+            echo "::error::could not read APP_VERSION from app/version.py"
+            exit 1
+          fi
+
           if [ "$app_version" != "$version" ]; then
             echo "::error::APP_VERSION ($app_version) does not match pyproject version ($version)"
             exit 1
