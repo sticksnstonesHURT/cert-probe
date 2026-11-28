@@ -208,15 +208,15 @@ To rebuild the binary yourself, run `packaging/build-cli.sh` inside a `manylinux
 - **No Python** installation; the interpreter and libraries are bundled.
 - A CA certificate bundle. The binary uses the system trust store, so a minimal container image without `ca-certificates` reports every certificate as `certificate_invalid` even though it was fetched and parsed correctly.
 
-| Distribution | glibc | Supported |
+| Distribution | glibc | Validation |
 |---|---|---|
-| Debian 11 (bullseye) | 2.31 | yes |
-| Debian 12 (bookworm) | 2.36 | yes |
-| Debian 13 (trixie) | 2.41 | yes |
-| Ubuntu 20.04 / 22.04 / 24.04 | 2.31 / 2.35 / 2.39 | yes |
-| Alpine (musl) | — | no |
+| Debian 11 (bullseye) | 2.31 | tested |
+| Debian 12 (bookworm) | 2.36 | tested |
+| Debian 13 (trixie) | 2.41 | expected |
+| Ubuntu 20.04 / 22.04 / 24.04 | 2.31 / 2.35 / 2.39 | expected |
+| Alpine (musl) | — | not supported |
 
-Debian 11 and Debian 12 were exercised with a built binary as part of release-build validation. The other rows follow from the asserted glibc floor rather than from a direct test on that distribution.
+`tested` means a built binary was run on that distribution during release-build validation. `expected` follows from the asserted glibc floor rather than from a direct test on that distribution.
 
 ### Usage
 
@@ -271,7 +271,7 @@ The API only ever allows globally-routable destinations. The CLI defaults to the
 | `0` | Verified. |
 | `1` | Certificate finding: `expired`, `hostname_mismatch` or `certificate_invalid`. |
 | `2` | Usage or configuration error. |
-| `3` | Network or destination error: blocked destination, DNS failure or timeout, connect failure or timeout, handshake timeout. |
+| `3` | Network or destination error: blocked destination, DNS failure, DNS timeout, DNS capacity exhaustion, connect failure or timeout, handshake timeout. |
 | `4` | Unexpected internal error. |
 
 A certificate finding is a successful answer, exactly as `POST /check` reports it with HTTP 200, so `1` does not mean the tool failed. For scripts that need the detail rather than the category, read `error.kind` from `--json`.
@@ -472,7 +472,7 @@ make check
 
 This runs `ruff format --check`, `ruff check`, `mypy` and `pytest`. 
 
-The suite is offline and deterministic; there are ten test files containing 189 test functions before parametrisation, collected as 326 cases (the two `live` tests are deselected).
+The suite is offline and deterministic; there are ten test files containing 189 test functions before parametrisation. 326 cases pass, with the two `live` tests deselected.
 
 | Area | Covered |
 |---|---|
@@ -622,7 +622,7 @@ They describe where this deployment saturates and how it fails; they are not a s
 - An explicit application-level request-body size limit is not currently configured.
 - No automated integration tests for the fixture scenarios.
 - The fixture container runs as root without resource limits, as described above.
-- The CLI builds on the host's system trust store and offers no flag for a custom CA bundle, so private CAs are not supported by the binary.
+- The CLI relies on the host's system trust store and offers no flag for a custom CA bundle, so private CAs are not supported by the binary.
 
 -----
 
