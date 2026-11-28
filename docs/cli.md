@@ -433,6 +433,14 @@ These are properties of the shared engine, not of the CLI, and they carry over u
 - **A stuck resolver cannot be killed.** `getaddrinfo` runs in a bounded pool; a worker that
   outlives its timeout window cannot be forcibly terminated, though the caller is freed
   immediately.
+- **The system trust store is the only source of trust.** The engine calls
+  `ssl.create_default_context()`, so the frozen binary inherits the host's CA bundle.
+  On a minimal container image that ships no CA certificates, every verification fails
+  with `certificate_invalid` ("unable to get local issuer certificate") even though the
+  certificate was fetched and parsed correctly. Install `ca-certificates`, or point
+  `SSL_CERT_FILE` at a bundle. There is no CLI flag for a custom trust store: the
+  `TLS_CHECKER_ADDITIONAL_CA_FILE` variable is test-mode-gated by design, so private
+  CAs are not currently supported by the CLI.
 - **Single-resolution, first-success connection.** Validated addresses are tried in order;
   the first successful connect wins.
 
