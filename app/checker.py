@@ -51,7 +51,9 @@ ErrorKind = Literal[
     "unknown_error",
 ]
 
-_CERTIFICATE_ERROR_KINDS: frozenset[ErrorKind] = frozenset(
+# Public: this exact set is what the CLI reports as a certificate finding
+# (its own exit code), so callers must not re-derive it.
+CERTIFICATE_ERROR_KINDS: frozenset[ErrorKind] = frozenset(
     {"expired", "hostname_mismatch", "certificate_invalid"}
 )
 
@@ -204,12 +206,12 @@ def _failure_result(
     dns_duration_ms: int,
 ) -> CheckResult:
     info: CertificateInfo | None = None
-    if failure.kind in _CERTIFICATE_ERROR_KINDS:
+    if failure.kind in CERTIFICATE_ERROR_KINDS:
         info = _inspect_unverified(hostname, settings, deadline, addresses)
 
     if failure.verified is not None:
         verified: bool | None = failure.verified
-    elif failure.kind in _CERTIFICATE_ERROR_KINDS:
+    elif failure.kind in CERTIFICATE_ERROR_KINDS:
         verified = False
     else:
         verified = None

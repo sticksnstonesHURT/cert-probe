@@ -5,7 +5,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from app.main import APP_VERSION
+from app.version import APP_VERSION
 
 
 def test_app_version_matches_pyproject() -> None:

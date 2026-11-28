@@ -10,14 +10,15 @@ from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, Request, Response
 
-from app.checker import CheckResult, ErrorKind, check_certificate
+from app.checker import ErrorKind, check_certificate
 from app.config import Settings, get_settings
 from app.errors import register_exception_handlers
 from app.logging import configure_logging
-from app.schemas import CheckErrorBody, CheckRequest, CheckResponse
+from app.render import to_response
+from app.schemas import CheckRequest, CheckResponse
+from app.version import APP_VERSION
 
 APP_TITLE = "Cert Probe"
-APP_VERSION = "0.2.0"
 logger = logging.getLogger(__name__)
 # Test seam: allows the request-duration test to patch an isolated
 # symbol instead of the shared time.monotonic, which Starlette, AnyIO
@@ -41,23 +42,6 @@ _STATUS_BY_KIND: dict[ErrorKind, int] = {
 
 def _settings_from_app(request: Request) -> Settings:
     return cast(Settings, request.app.state.settings)
-
-
-def _result_to_response(result: CheckResult) -> CheckResponse:
-    error: CheckErrorBody | None = None
-    if result.error is not None:
-        error = CheckErrorBody(kind=result.error.kind, message=result.error.message)
-    return CheckResponse(
-        hostname=result.hostname,
-        verified=result.verified,
-        hostname_verified=result.hostname_verified,
-        subject=result.subject,
-        issuer=result.issuer,
-        not_before=result.not_before,
-        not_after=result.not_after,
-        days_remaining=result.days_remaining,
-        error=error,
-    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -114,7 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.method,
             request.url.path,
         )
-        return _result_to_response(result)
+        return to_response(result)
 
     return api
 
