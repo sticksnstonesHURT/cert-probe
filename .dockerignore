@@ -40,3 +40,6 @@ venv/
 docs/
 README.md
 Makefile
+
+# --- CLI sources (the release binaries are built outside the image) ---
+cli/

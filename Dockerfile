@@ -40,8 +40,11 @@ COPY pyproject.toml uv.lock .python-version ./
 
 # --locked             : fail the build if uv.lock disagrees with pyproject.toml
 # --no-dev             : runtime deps only (no pytest, mypy, ruff, httpx)
-# --no-install-project : cert-probe has no [build-system]; skip installing it.
-#                        In-container imports of app.* work via cwd=/app.
+# --no-install-project : the image runs the API only, so the cert-probe
+#                        distribution (the `app` and `cli` packages and the
+#                        `probe` console script) is deliberately not installed.
+#                        In-container imports of app.* work via cwd=/app, and no
+#                        `probe` binary exists in the image.
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY app ./app
